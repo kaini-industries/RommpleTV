@@ -27,17 +27,23 @@ public final class RommClient: @unchecked Sendable {
 
     /// One page of the library plus the server's total count (nil when the
     /// server answered with a bare array), so callers can page to completion.
-    public func romsPage(platformId: Int, limit: Int = 100,
-                         offset: Int = 0) async throws -> (items: [Rom], total: Int?) {
+    public func romsPage(
+        platformId: Int,
+        limit: Int = 48,
+        offset: Int = 0,
+        sort: RomSort = .titleAscending,
+        groupByMetaId: Bool = true
+    ) async throws -> RomPage {
         // RomM 5.x silently ignores the singular `platform_id` query param (returns the
         // whole library unfiltered). The working parameter is `platform_ids` (plural).
         // The ROM object's own field is still `platform_id` (singular); only this query
         // param differs.
         let page = try await get(RomsPage.self, path: "/api/roms", query: [
             "platform_ids": String(platformId), "limit": String(limit),
-            "offset": String(offset), "order_by": "name", "order_dir": "asc",
+            "offset": String(offset), "order_by": sort.orderBy,
+            "order_dir": sort.orderDirection, "group_by_meta_id": String(groupByMetaId),
         ])
-        return (page.items, page.total)
+        return RomPage(items: page.items, total: page.total, limit: limit, offset: offset)
     }
 
     public func romContentURL(id: Int, fsName: String) -> URL {
