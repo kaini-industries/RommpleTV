@@ -1,0 +1,29 @@
+{
+  "items": [
+    {
+      "id": 101,
+      "name": "Example Adventure",
+      "fs_name": "Example Adventure.sfc",
+      "platform_id": 1,
+      "fs_size_bytes": 8,
+      "path_cover_small": "/assets/romm/resources/roms/1/101/cover/small.png?ts=2026-01-01 00:00:00"
+    },
+    {
+      "id": 102,
+      "name": "Example Racer",
+      "fs_name": "Example Racer.sfc",
+      "platform_id": 1,
+      "fs_size_bytes": 16,
+      "path_cover_small": null
+    },
+    {
+      "id": 103,
+      "name": "Example Puzzle",
+      "fs_name": "Example Puzzle.sfc",
+      "platform_id": 1,
+      "fs_size_bytes": 32,
+      "path_cover_small": null
+    }
+  ],
+  "total": 3
+}

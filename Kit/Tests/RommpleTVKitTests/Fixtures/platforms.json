@@ -1,0 +1,4 @@
+[
+  {"id": 1, "slug": "snes", "name": "Super Nintendo Entertainment System", "rom_count": 3},
+  {"id": 2, "slug": "nes", "name": "Nintendo Entertainment System", "rom_count": 2}
+]

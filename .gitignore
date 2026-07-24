@@ -1,0 +1,49 @@
+# Xcode and build output
+RommpleTV.xcodeproj/
+build/
+build-*/
+DerivedData/
+*.xcuserstate
+*.xcuserdata/
+.DS_Store
+
+# SwiftPM
+Kit/.build/
+Kit/.swiftpm/
+
+# Local credentials and configuration
+*.token
+.env
+.env.*
+*.xcconfig
+App/LocalConfig.generated.swift
+
+# Local worktrees
+.worktrees/
+
+# Downloaded libretro cores and generated provenance
+Cores/**/*.dylib
+Cores/MANIFEST.md
+
+# Game, firmware, save, and state content
+*.nes
+*.fds
+*.sfc
+*.smc
+*.gb
+*.gbc
+*.gba
+*.gen
+*.sms
+*.gg
+*.vb
+*.rom
+*.bin
+*.cue
+*.chd
+*.iso
+*.bios
+*.sav
+*.srm
+*.state
+*.state[0-9]*

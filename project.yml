@@ -1,0 +1,49 @@
+name: RommpleTV
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    tvOS: "17.0"
+packages:
+  RommpleTVKit:
+    path: Kit
+targets:
+  RommpleTV:
+    type: application
+    platform: tvOS
+    sources: [App]
+    dependencies:
+      - package: RommpleTVKit
+      - framework: Cores/tvos/snes9x_libretro_tvos.dylib
+        embed: true
+        codeSign: true
+        link: false
+      - framework: Cores/tvos/mgba_libretro_tvos.dylib
+        embed: true
+        codeSign: true
+        link: false
+      - framework: Cores/tvos/genesis_plus_gx_libretro_tvos.dylib
+        embed: true
+        codeSign: true
+        link: false
+      - framework: Cores/tvos/fceumm_libretro_tvos.dylib
+        embed: true
+        codeSign: true
+        link: false
+      - framework: Cores/tvos/mednafen_vb_libretro_tvos.dylib
+        embed: true
+        codeSign: true
+        link: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.rommpletv
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: "5.0"
+        TVOS_DEPLOYMENT_TARGET: "17.0"
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"
+    info:
+      path: App/Info.plist
+      properties:
+        UILaunchScreen: {}
+        NSLocalNetworkUsageDescription: "RommpleTV talks to your RomM server on the local network."
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
