@@ -86,6 +86,13 @@ final class RommClientTests: XCTestCase {
         XCTAssertEqual(query["order_dir"], "desc")
         XCTAssertEqual(query["group_by_meta_id"], "true")
         XCTAssertNil(query["platform_id"])
+
+        // `limit: 48` above equals romsPage's own default, so it alone would still pass
+        // against a client that hardcoded "limit": "48" rather than threading the
+        // argument through. Prove threading with a non-default limit.
+        _ = try await makeClient().romsPage(platformId: 35, limit: 24, offset: 96, sort: .sizeLargest)
+        let secondURL = try XCTUnwrap(capturedURL)
+        XCTAssertEqual(queryDict(from: secondURL)["limit"], "24")
     }
 
     func testEveryRomSortMapsToExpectedServerFields() async throws {
@@ -132,7 +139,10 @@ final class RommClientTests: XCTestCase {
             "sibling_roms": [
               {"id": 102, "name": "Example Adventure (Alt)",
                "fs_name_no_tags": "Example Adventure (Alt)",
-               "fs_name_no_ext": "Example Adventure (Alt)", "is_main_sibling": false}
+               "fs_name_no_ext": "Example Adventure (Alt)", "is_main_sibling": false},
+              {"id": 104, "name": null,
+               "fs_name_no_tags": "Example Adventure (Unscraped)",
+               "fs_name_no_ext": "Example Adventure (Unscraped)", "is_main_sibling": false}
             ]
           },
           {
@@ -145,12 +155,15 @@ final class RommClientTests: XCTestCase {
         let page = try await makeClient().romsPage(platformId: 1)
         XCTAssertEqual(page.items.count, 2)
         let withSibling = page.items[0]
-        XCTAssertEqual(withSibling.siblingRoms.count, 1)
+        XCTAssertEqual(withSibling.siblingRoms.count, 2)
         XCTAssertEqual(withSibling.siblingRoms[0].id, 102)
         XCTAssertEqual(withSibling.siblingRoms[0].name, "Example Adventure (Alt)")
         XCTAssertEqual(withSibling.siblingRoms[0].fsNameNoTags, "Example Adventure (Alt)")
         XCTAssertEqual(withSibling.siblingRoms[0].fsNameNoExt, "Example Adventure (Alt)")
         XCTAssertEqual(withSibling.siblingRoms[0].isMainSibling, false)
+        // RomM's SiblingRomSchema.name is `str | None`; a sibling with no scraped name
+        // must decode (to nil) rather than failing the whole page.
+        XCTAssertNil(withSibling.siblingRoms[1].name)
         XCTAssertTrue(page.items[1].siblingRoms.isEmpty)
     }
 

@@ -20,7 +20,9 @@ public struct Platform: Identifiable, Decodable, Sendable {
 /// `platform_id`, so decoding a sibling as `Rom` would fail.
 public struct SiblingRom: Identifiable, Decodable, Sendable {
     public let id: Int
-    public let name: String
+    // RomM's SiblingRomSchema.name is `str | None` — a sibling with no scraped
+    // name is valid and must not fail the whole page decode.
+    public let name: String?
     public let fsNameNoTags: String
     public let fsNameNoExt: String
     public let isMainSibling: Bool
