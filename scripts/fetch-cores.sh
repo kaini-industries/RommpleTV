@@ -4,8 +4,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 BB=https://buildbot.libretro.com/nightly/apple
-CORES_TVOS=(snes9x mgba genesis_plus_gx fceumm mednafen_vb)
-CORES_MACOS=(snes9x mgba genesis_plus_gx fceumm mednafen_vb)
+CORES_TVOS=(snes9x mgba genesis_plus_gx fceumm mednafen_vb mednafen_psx)
+CORES_MACOS=(snes9x mgba genesis_plus_gx fceumm mednafen_vb mednafen_psx)
 mkdir -p Cores/tvos Cores/macos
 fetch() { # $1 url  $2 outdir
   local zip; zip="$2/$(basename "$1")"

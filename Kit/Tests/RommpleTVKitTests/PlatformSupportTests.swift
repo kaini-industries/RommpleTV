@@ -21,12 +21,18 @@ final class PlatformSupportTests: XCTestCase {
         }
     }
     func testUnplayableSlugs() {
-        for slug in ["gamecube", "wii", "ps2", "switch", "n64", "psx"] {
+        for slug in ["gamecube", "wii", "ps2", "switch", "n64"] {
             XCTAssertNil(PlatformSupport.core(forSlug: slug), slug)
             XCTAssertFalse(PlatformSupport.isPlayable(slug: slug), slug)
         }
     }
     func testCaseInsensitive() {
         XCTAssertNotNil(PlatformSupport.core(forSlug: "SNES"))
+    }
+    func testPlayStationUsesSoftwareBeetlePSX() {
+        let core = PlatformSupport.core(forSlug: "psx")
+        XCTAssertEqual(core?.coreName, "mednafen_psx_libretro_tvos")
+        XCTAssertEqual(core?.displayName, "Beetle PSX")
+        XCTAssertFalse(PlatformSupport.isPlayable(slug: "PSX"))
     }
 }

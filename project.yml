@@ -33,6 +33,10 @@ targets:
         embed: true
         codeSign: true
         link: false
+      - framework: Cores/tvos/mednafen_psx_libretro_tvos.dylib
+        embed: true
+        codeSign: true
+        link: false
     # PRODUCT_BUNDLE_IDENTIFIER, DEVELOPMENT_TEAM and CODE_SIGN_STYLE live in
     # the xcconfig, not in `settings` below — target settings would override the
     # xcconfig and defeat the untracked Config/Local.xcconfig override.
