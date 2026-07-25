@@ -12,6 +12,25 @@ enum ConfigStore {
         else { return nil }
         return RommConfig(baseURL: url, token: token)
     }
+    /// Stored configuration, falling back to whatever the build baked in.
+    ///
+    /// Baking a URL and token into a development build avoids typing them on a
+    /// television with a Siri Remote. It is a shortcut, not the intended end
+    /// state — a real auth flow (the TV displaying a code that a phone
+    /// authorizes, since the Apple TV has no camera to scan one) belongs on the
+    /// polish list. Values come from `scripts/gen-local-config.sh` and are empty
+    /// in any build without an untracked `Config/local.env` and `.romm.token`.
+    ///
+    /// Note that a baked build re-seeds itself on the next launch after a reset;
+    /// the reset still works, it just does not survive relaunch.
+    static func loadOrSeedFromBakedDefaults() -> RommConfig? {
+        if let stored = load() { return stored }
+        guard !LocalConfig.defaultBaseURL.isEmpty, !LocalConfig.defaultToken.isEmpty,
+              save(baseURL: LocalConfig.defaultBaseURL, token: LocalConfig.defaultToken)
+        else { return nil }
+        return load()
+    }
+
     @discardableResult
     static func save(baseURL: String, token: String) -> Bool {
         var normalized = baseURL

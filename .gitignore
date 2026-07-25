@@ -15,7 +15,9 @@ Kit/.swiftpm/
 *.token
 .env
 .env.*
+Config/local.env
 *.xcconfig
+!Config/Public.xcconfig
 App/LocalConfig.generated.swift
 
 # Local worktrees

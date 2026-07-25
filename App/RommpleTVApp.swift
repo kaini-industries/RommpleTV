@@ -3,7 +3,7 @@ import RommpleTVKit
 
 @main
 struct RommpleTVApp: App {
-    @State private var config = ConfigStore.load()
+    @State private var config = ConfigStore.loadOrSeedFromBakedDefaults()
     var body: some Scene {
         WindowGroup {
             Group {

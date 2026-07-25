@@ -1,0 +1,16 @@
+// Public build settings. This file is tracked and must never contain private
+// values — no team identifier, no personal bundle identifier, no server address.
+//
+// A clone of this repository builds for the tvOS Simulator with exactly these
+// settings. Signing for a real device needs an Apple Developer team, which is
+// personal, so it lives in Config/Local.xcconfig — untracked, and pulled in by
+// the optional include on the last line.
+//
+// `#include?` (with the question mark) is silently skipped when the file is
+// absent, so the public path keeps working with no local setup at all.
+
+PRODUCT_BUNDLE_IDENTIFIER = com.example.rommpletv
+DEVELOPMENT_TEAM =
+CODE_SIGN_STYLE = Automatic
+
+#include? "Local.xcconfig"

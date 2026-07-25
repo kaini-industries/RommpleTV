@@ -33,10 +33,14 @@ targets:
         embed: true
         codeSign: true
         link: false
+    # PRODUCT_BUNDLE_IDENTIFIER, DEVELOPMENT_TEAM and CODE_SIGN_STYLE live in
+    # the xcconfig, not in `settings` below — target settings would override the
+    # xcconfig and defeat the untracked Config/Local.xcconfig override.
+    configFiles:
+      Debug: Config/Public.xcconfig
+      Release: Config/Public.xcconfig
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.example.rommpletv
-        CODE_SIGN_STYLE: Automatic
         SWIFT_VERSION: "5.0"
         TVOS_DEPLOYMENT_TARGET: "17.0"
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"
