@@ -45,7 +45,11 @@ extension CoreError: LocalizedError {
         case .alreadyLoaded: return "Another game is still running — back out and try again."
         case .discControlUnavailable: return "This game doesn't have discs to switch between."
         case .discIndexOutOfRange(let index, let count):
-            return "There's no disc \(index + 1) in this game (it has \(count))."
+            // Discs are 1-based to a player. `index` is whatever was asked
+            // for, including `Int.max`, so the +1 has to not trap while
+            // rendering an error about a bad number.
+            let humanIndex = index < Int.max ? index + 1 : index
+            return "There's no disc \(humanIndex) in this game (it has \(count))."
         case .discSwitchFailed:
             return "The game wouldn't change discs just now — try again in a moment."
         }
@@ -387,7 +391,12 @@ public final class LibretroCore {
     }
 
     /// Hands the game to the core the way the core asked to receive it.
+    ///
+    /// One game per core: a second load would replace the retained path while
+    /// a `need_fullpath` core is still reading through it, so it is refused
+    /// rather than left to the caller to avoid.
     public func loadGame(at romURL: URL) throws {
+        guard !gameLoaded else { throw CoreError.alreadyLoaded }
         let payload = try payloadFactory.makePayload(for: romURL)
         var loaded = false
         switch payload {

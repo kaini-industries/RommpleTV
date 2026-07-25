@@ -295,10 +295,15 @@ final class LibretroCoreTests: XCTestCase {
         XCTAssertFalse((e.errorDescription ?? "").isEmpty)
         XCTAssertFalse(CoreError.alreadyLoaded.errorDescription!.contains("error 3"))
         for error: CoreError in [.discControlUnavailable, .discSwitchFailed,
-                                 .discIndexOutOfRange(index: 4, count: 2)] {
+                                 .discIndexOutOfRange(index: 4, count: 2),
+                                 // Rendering the message for an absurd index
+                                 // must not trap on the 1-based conversion.
+                                 .discIndexOutOfRange(index: .max, count: 2)] {
             XCTAssertFalse((error.errorDescription ?? "").isEmpty,
                            "\(error) needs a sentence a player can read")
         }
+        XCTAssertTrue(CoreError.discIndexOutOfRange(index: 4, count: 2)
+            .errorDescription!.contains("disc 5"), "discs read 1-based to a player")
     }
 
     // MARK: - Path-only loading
@@ -360,32 +365,77 @@ final class LibretroCoreTests: XCTestCase {
         try XCTSkipIf(checked == 0, "no core dylibs present (gitignored)")
     }
 
-    func testGenesisPlusGXLoadsFromPathWithNoBytes() throws {
-        let corePath = FileManager.default.currentDirectoryPath
-            + "/../Cores/macos/genesis_plus_gx_libretro.dylib"
-        try skipUnlessCorePresent(corePath)
-        let dir = try scratchDirectory("rommple-genesis-fullpath")
-        let rom = dir.appendingPathComponent("minimal-cartridge.gen")
-        try Self.minimalGenesisROM().write(to: rom, options: .atomic)
-        defer { try? FileManager.default.removeItem(at: rom) }
+    static let gpgxCorePath = FileManager.default.currentDirectoryPath
+        + "/../Cores/macos/genesis_plus_gx_libretro.dylib"
 
-        let core = try LibretroCore(dylibPath: corePath,
+    /// Loads one synthetic cartridge through Genesis Plus GX's file route and
+    /// asserts it really ran.
+    ///
+    /// GPGX's memory route (`memcpy` from `info->data`) returns early; the
+    /// file route it takes now opens the file itself and derives the system
+    /// from the *filename*. That hint is why each extension is worth its own
+    /// cartridge rather than one standing in for the rest.
+    private func runSegaCartridge(_ fileName: String, bytes: Data, in dir: URL) throws {
+        let rom = dir.appendingPathComponent(fileName)
+        try bytes.write(to: rom, options: .atomic)
+        let core = try LibretroCore(dylibPath: Self.gpgxCorePath,
                                     systemDirectory: dir, saveDirectory: dir)
         defer { core.unload() }
         let sink = FrameCollector()
         core.sink = sink
 
-        // Genesis Plus GX reports need_fullpath, so this is the path branch —
-        // the one NES and Genesis moved onto when the core's own answer
-        // started being honoured.
-        XCTAssertTrue(core.needsFullPath)
+        XCTAssertTrue(core.needsFullPath, fileName)
         try core.loadGame(at: rom)
-        XCTAssertNil(core.romData, "nothing was read into memory")
-        XCTAssertNotNil(core.gamePath.pointer)
-        let av = try XCTUnwrap(core.avInfo)
-        XCTAssertGreaterThanOrEqual(av.baseWidth, 256)   // 256 until the VDP widens it
+        XCTAssertNil(core.romData, "\(fileName): nothing was read into memory")
+        XCTAssertNotNil(core.gamePath.pointer, fileName)
+
+        // GPGX implements Disk Control for Sega CD, so a *cartridge* has to
+        // report no discs. Task 10 must not read `discCount > 0` as "this is
+        // a PlayStation game" — this is the assertion that says so.
+        XCTAssertEqual(core.discCount, 0, "\(fileName): a cartridge has no discs")
+        XCTAssertNil(core.currentDiscIndex, fileName)
+
+        let av = try XCTUnwrap(core.avInfo, fileName)
+        XCTAssertGreaterThanOrEqual(av.baseWidth, 160, fileName)
+        XCTAssertGreaterThan(av.sampleRate, 20_000, fileName)
         for _ in 0..<60 { core.runFrame() }
-        XCTAssertGreaterThan(sink.audioFrameCount, 20_000, "≈1s of audio in 60 frames")
+        XCTAssertGreaterThan(sink.frames, 0, "\(fileName): no video frame ever arrived")
+        XCTAssertGreaterThan(sink.audioFrameCount, 20_000,
+                             "\(fileName): ≈1s of audio in 60 frames")
+    }
+
+    func testGenesisPlusGXLoadsFromPathWithNoBytes() throws {
+        try skipUnlessCorePresent(Self.gpgxCorePath)
+        let dir = try scratchDirectory("rommple-genesis-fullpath")
+        try runSegaCartridge("minimal-cartridge.gen", bytes: Self.minimalGenesisROM(), in: dir)
+    }
+
+    /// `genesis`, `segacd`, `sms` and `gamegear` all map to this one core
+    /// (`PlatformSupport.map`), so honouring `need_fullpath` moved four
+    /// accepted platforms onto the file route at once. Master System and Game
+    /// Gear are the ones whose format is decided by the filename.
+    func testGenesisPlusGXLoadsSegaEightBitCartridgesFromPath() throws {
+        try skipUnlessCorePresent(Self.gpgxCorePath)
+        let dir = try scratchDirectory("rommple-sega8-fullpath")
+        try runSegaCartridge("minimal-cartridge.sms",
+                             bytes: Self.minimalSegaEightBitROM(regionAndSize: 0x4C), in: dir)
+        try runSegaCartridge("minimal-cartridge.gg",
+                             bytes: Self.minimalSegaEightBitROM(regionAndSize: 0x6C), in: dir)
+    }
+
+    /// A synthetic, copyright-free Master System / Game Gear cartridge: a Z80
+    /// jump-to-self at the reset vector and a "TMR SEGA" header. `regionAndSize`
+    /// is the 0x7FFF byte — 0x4C for SMS export, 0x6C for Game Gear export.
+    static func minimalSegaEightBitROM(regionAndSize: UInt8,
+                                       byteCount: Int = 32 * 1024) -> Data {
+        var rom = Data(repeating: 0xFF, count: byteCount)
+        rom[0] = 0x18
+        rom[1] = 0xFE                                  // JR $-2 — halt in place
+        let header = 0x7FF0
+        rom.replaceSubrange(header..<(header + 8), with: Array("TMR SEGA".utf8))
+        for offset in (header + 8)..<(header + 15) { rom[offset] = 0 }  // reserved, checksum, code
+        rom[0x7FFF] = regionAndSize
+        return rom
     }
 
     /// A synthetic, copyright-free Mega Drive cartridge: vector table, header,
@@ -544,6 +594,14 @@ final class LibretroCoreTests: XCTestCase {
 
     bool retro_load_game(const struct retro_game_info *info) {
       if (!info) return false;
+    #ifdef FAKE_REJECT_LOAD
+      /* Records what it was given, then refuses -- the frontend's failure
+         path has to clear both retained things either way. */
+      g_had_data = info->data != NULL;
+      g_had_path = info->path != NULL;
+      g_size = (unsigned long)info->size;
+      return false;
+    #endif
       g_had_data = info->data != NULL;
       g_had_path = info->path != NULL;
       g_size = (unsigned long)info->size;
@@ -581,20 +639,40 @@ final class LibretroCoreTests: XCTestCase {
     size_t retro_get_memory_size(unsigned id) { (void)id; return 0; }
     """
 
-    /// Compiles the recorder above into a dylib. Skips when there is no
-    /// toolchain to compile it with rather than failing.
-    func buildFakeCore(needsFullPath: Bool, in dir: URL) throws -> String {
+    struct FakeCoreBuildFailure: Error, CustomStringConvertible {
+        let description: String
+    }
+
+    /// Compiles the recorder above into a dylib.
+    ///
+    /// These are the only tests that can see the `retro_game_info` a core
+    /// receives, so a missing toolchain **fails** rather than quietly greening
+    /// the suite with that contract unguarded. An image that genuinely has no
+    /// C compiler opts out explicitly with `ROMMPLETV_NO_C_TOOLCHAIN`, the
+    /// same shape as the M3U fixture's gate.
+    func buildFakeCore(needsFullPath: Bool, rejectLoad: Bool = false,
+                       in dir: URL) throws -> String {
+        let optedOut = ProcessInfo.processInfo.environment["ROMMPLETV_NO_C_TOOLCHAIN"] != nil
+        func giveUp(_ reason: String) -> Error {
+            optedOut ? XCTSkip("ROMMPLETV_NO_C_TOOLCHAIN is set: \(reason)")
+                     : FakeCoreBuildFailure(description:
+                        "\(reason) — these tests are the only cover for what "
+                        + "reaches retro_load_game. Set ROMMPLETV_NO_C_TOOLCHAIN "
+                        + "to skip them deliberately.")
+        }
         guard FileManager.default.isExecutableFile(atPath: "/usr/bin/xcrun") else {
-            throw XCTSkip("no /usr/bin/xcrun to build the recording core with")
+            throw giveUp("no /usr/bin/xcrun to build the recording core with")
         }
         let source = dir.appendingPathComponent("fake_core.c")
         try Self.fakeCoreSource.write(to: source, atomically: true, encoding: .utf8)
         let dylib = dir.appendingPathComponent("fake_core.dylib")
+        var arguments = ["clang", "-dynamiclib", "-O0",
+                         "-DFAKE_NEED_FULLPATH=\(needsFullPath ? 1 : 0)"]
+        if rejectLoad { arguments.append("-DFAKE_REJECT_LOAD=1") }
+        arguments += ["-o", dylib.path, source.path]
         let clang = Process()
         clang.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
-        clang.arguments = ["clang", "-dynamiclib", "-O0",
-                           "-DFAKE_NEED_FULLPATH=\(needsFullPath ? 1 : 0)",
-                           "-o", dylib.path, source.path]
+        clang.arguments = arguments
         let errors = Pipe()
         clang.standardError = errors
         try clang.run()
@@ -602,7 +680,7 @@ final class LibretroCoreTests: XCTestCase {
                              as: UTF8.self)
         clang.waitUntilExit()
         guard clang.terminationStatus == 0 else {
-            throw XCTSkip("couldn't build the recording core: \(message)")
+            throw giveUp("couldn't build the recording core: \(message)")
         }
         return dylib.path
     }
@@ -724,6 +802,61 @@ final class LibretroCoreTests: XCTestCase {
         XCTAssertEqual(core.discCount, 0, "both interfaces are dropped on unload")
         XCTAssertNil(core.currentDiscIndex)
         XCTAssertThrowsError(try core.switchDisc(to: 0))
+    }
+
+    /// The failure-clearing rule for both branches, with no gitignored core
+    /// involved: a build of the recorder that records and then refuses.
+    func testRejectedLoadClearsBothRetainedThingsInEitherBranch() throws {
+        for needsFullPath in [false, true] {
+            let dir = try scratchDirectory("rommple-fake-reject-\(needsFullPath)")
+            let dylib = try buildFakeCore(needsFullPath: needsFullPath,
+                                          rejectLoad: true, in: dir)
+            let file = dir.appendingPathComponent("content.fake")
+            try Data(repeating: 0x11, count: 2048).write(to: file, options: .atomic)
+
+            let core = try LibretroCore(dylibPath: dylib,
+                                        systemDirectory: dir, saveDirectory: dir)
+            defer { core.unload() }
+            XCTAssertEqual(core.needsFullPath, needsFullPath)
+            XCTAssertThrowsError(try core.loadGame(at: file)) { error in
+                guard case CoreError.loadGameFailed = error else {
+                    return XCTFail("expected loadGameFailed, got \(error)")
+                }
+            }
+            XCTAssertNil(core.romData,
+                         "rejected load kept bytes (needsFullPath: \(needsFullPath))")
+            XCTAssertNil(core.gamePath.pointer,
+                         "rejected load kept a path (needsFullPath: \(needsFullPath))")
+
+            // A refusal is not a loaded game, so the core is still retryable.
+            XCTAssertThrowsError(try core.loadGame(at: file)) { error in
+                guard case CoreError.loadGameFailed = error else {
+                    return XCTFail("a retry must reach the core again, got \(error)")
+                }
+            }
+        }
+    }
+
+    func testSecondLoadIsRefusedWhileAGameIsLoaded() throws {
+        let dir = try scratchDirectory("rommple-fake-second-load")
+        let dylib = try buildFakeCore(needsFullPath: true, in: dir)
+        let file = dir.appendingPathComponent("disc.fake")
+        try Data("m3u".utf8).write(to: file, options: .atomic)
+
+        let core = try LibretroCore(dylibPath: dylib, systemDirectory: dir, saveDirectory: dir)
+        defer { core.unload() }
+        try core.loadGame(at: file)
+        let retained = try XCTUnwrap(core.gamePath.pointer)
+
+        XCTAssertThrowsError(try core.loadGame(at: file)) { error in
+            guard case CoreError.alreadyLoaded = error else {
+                return XCTFail("expected alreadyLoaded, got \(error)")
+            }
+        }
+        // The point of refusing: replacing the retained path would free a
+        // string a need_fullpath core is still reading through.
+        XCTAssertEqual(core.gamePath.pointer, retained)
+        XCTAssertEqual(String(cString: retained), file.path)
     }
 
     func testFullPathPayloadDoesNotReadContentIntoData() throws {
