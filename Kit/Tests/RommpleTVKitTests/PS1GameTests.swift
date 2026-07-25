@@ -233,6 +233,28 @@ final class PS1GameTests: XCTestCase {
         XCTAssertEqual(game.excludedSiblings.map(\.id), [311])
     }
 
+    /// The case that pins *which* totals rule is in force, which the test above
+    /// cannot: `1 of 2` + `2 of 3` is rejected by the weaker "every total must
+    /// agree with the disc count" rule too (max is 3, two discs found), so with
+    /// `declared.count == 1` deleted the whole suite stays green.
+    ///
+    /// `1 of 1` + `2 of 2` is the input that separates them. Two discs found, and
+    /// a rule reading only the largest total sees 2 == 2 and merges — a game
+    /// whose own filenames each say they are complete on their own. It also
+    /// pins the reason the clause cannot simply be dropped: `declared` is a
+    /// `Set`, so with the count check gone `declared.first` is an arbitrary one
+    /// of {1, 2} and the merge decision for this input is not even deterministic.
+    func testTotalsThatDisagreeWhileMatchingTheDiscCountStillCollapse() {
+        let rep = rom(340, "Vault Runner (USA) (Disc 1 of 1).chd",
+                      siblings: [sib(341, "Vault Runner (USA) (Disc 2 of 2)")])
+        let game = PS1GameClassifier.classify(rep)
+        XCTAssertEqual(game.discs.map(\.romID), [340],
+                       "two discs each declaring a different total must not merge")
+        XCTAssertEqual(game.discs.map(\.index), [1])
+        XCTAssertEqual(game.canonicalRomID, 340)
+        XCTAssertEqual(game.excludedSiblings.map(\.id), [341])
+    }
+
     func testATotalDeclaredOnOnlyOneDiscStillGoverns() {
         let complete = rom(320, "Vault Runner (USA) (Disc 1 of 2).chd",
                            siblings: [sib(321, "Vault Runner (USA) (Disc 2)")])
