@@ -5,20 +5,41 @@ final class ControllerInput {
     private var handler: ((RetroButton, Bool) -> Void)?
     private var overlayHandler: (() -> Void)?
     private var disconnectHandler: (() -> Void)?
+    /// The block-based observers this instance registered.
+    ///
+    /// Kept because `addObserver(forName:object:queue:using:)` returns a token
+    /// that is the *only* way to deregister — the observer it creates is an
+    /// opaque object, not `self`, so `removeObserver(self)` would not touch it.
+    /// Without this, one pair of registrations accumulated on the default center
+    /// per game launched. They captured `[weak self]`, so nothing misbehaved,
+    /// but every pad connect/disconnect walked a list that only ever grew.
+    private var observers: [NSObjectProtocol] = []
 
     func attach(_ handler: @escaping (RetroButton, Bool) -> Void) {
         self.handler = handler
-        NotificationCenter.default.addObserver(
+        // Idempotent: a second attach replaces the first rather than doubling it.
+        removeObservers()
+        observers.append(NotificationCenter.default.addObserver(
             forName: .GCControllerDidConnect, object: nil, queue: .main
-        ) { [weak self] _ in self?.mapAll() }
+        ) { [weak self] _ in self?.mapAll() })
         // A dead battery or an out-of-range pad should not leave the game
         // holding whatever direction/button was pressed at the moment of
         // disconnect — the engine zeroes all buttons in response to this.
-        NotificationCenter.default.addObserver(
+        observers.append(NotificationCenter.default.addObserver(
             forName: .GCControllerDidDisconnect, object: nil, queue: .main
-        ) { [weak self] _ in self?.disconnectHandler?() }
+        ) { [weak self] _ in self?.disconnectHandler?() })
         mapAll()
     }
+
+    /// Hands the registrations back. Called from `deinit`, which runs when
+    /// `EmulatorEngine` is released — after `dismantleUIViewController` has torn
+    /// the game down — so a session's observers do not outlive it.
+    private func removeObservers() {
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
+        observers.removeAll()
+    }
+
+    deinit { removeObservers() }
 
     /// Registers the pause-overlay trigger for the Xbox pad's left-stick
     /// click (`leftThumbstickButton`) — the Siri remote's play/pause
