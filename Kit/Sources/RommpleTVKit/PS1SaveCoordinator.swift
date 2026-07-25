@@ -884,9 +884,20 @@ public actor PS1SaveCoordinator {
 
     /// One flush plus the release of the in-flight slot, as one task. See
     /// `flush()` for why the release lives in here rather than after the await.
+    ///
+    /// `defer` rather than a trailing statement, and the two are semantically
+    /// identical today: `performFlush` is non-throwing and every early return in
+    /// it falls through to here, and a `defer` runs before this function returns
+    /// — therefore before the enclosing task completes — so the
+    /// released-before-completion invariant `flush()`'s termination argument
+    /// rests on is unchanged. What it buys is the edit it survives: a `try`, a
+    /// `guard ... else { return }`, or a cancellation check added to this
+    /// function would otherwise orphan the slot, and an orphaned `flushTask`
+    /// wedges every subsequent upload for the life of the coordinator — the
+    /// worst failure this file has.
     private func runFlush() async {
+        defer { flushTask = nil }
         await performFlush()
-        flushTask = nil
     }
 
     /// One upload attempt for the pending card. Only ever entered through
