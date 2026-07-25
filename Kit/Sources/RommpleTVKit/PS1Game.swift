@@ -53,6 +53,9 @@ public struct PS1Game: Identifiable, Sendable {
 /// `range` indexes the `Character` array of that same name.
 struct DiscToken {
     let index: Int
+    /// The `N` of a `1 of N` token, when the filename declared one. The
+    /// classifier refuses to merge a set that contradicts it.
+    let total: Int?
     let range: Range<Int>
     var label: String { "Disc \(index)" }
 }
@@ -65,7 +68,7 @@ struct DiscToken {
 ///     token   := boundary keyword value boundary
 ///     keyword := "disc" | "disk" | "cd"            (case-insensitive)
 ///     value   := sep* number ( sep+ "of" sep* number )?
-///              | sep+ letter
+///              | sep+ letter                       (not after "cd")
 ///     number  := ASCII digits, value > 0            (leading zeros allowed)
 ///     letter  := one ASCII letter A–Z → 1–26
 ///     sep     := space | tab | "." | "-" | "_"
@@ -76,9 +79,12 @@ struct DiscToken {
 /// `Abcd 2` (keyword glued to `Ab`). The `sep+` before a single letter is the
 /// third guard: without it, `Disco Inferno` would read as `Disc O` — a token
 /// with a plausible-looking index, which is far more dangerous than no token.
+/// The fourth is that `cd` takes no letter value at all: `CD-i`, `CD-R` and
+/// `CD-X` are product names, and letter-numbered rips in the wild are written
+/// `Disc A`/`Disk A`, never `CD A`.
 enum DiscTokenScanner {
-    private static let keywords: [[Character]] = [
-        Array("disc"), Array("disk"), Array("cd"),
+    private static let keywords: [(characters: [Character], allowsLetterValue: Bool)] = [
+        (Array("disc"), true), (Array("disk"), true), (Array("cd"), false),
     ]
     private static let separators: Set<Character> = [" ", "\t", ".", "-", "_"]
 
@@ -147,9 +153,9 @@ enum DiscTokenScanner {
     private static func token(in chars: [Character], at start: Int) -> DiscToken? {
         // Leading boundary: the keyword may not continue a word.
         if start > 0, isWordCharacter(chars[start - 1]) { return nil }
-        guard let afterKeyword = matchKeyword(chars, at: start) else { return nil }
+        guard let keyword = matchKeyword(chars, at: start) else { return nil }
 
-        var cursor = afterKeyword
+        var cursor = keyword.end
         var separatorCount = 0
         while cursor < chars.count, separators.contains(chars[cursor]) {
             cursor += 1
@@ -157,41 +163,49 @@ enum DiscTokenScanner {
         }
         guard cursor < chars.count else { return nil }
 
-        if let (value, end) = matchNumber(chars, from: cursor) {
-            return DiscToken(index: value, range: start..<end)
+        if let (value, total, end) = matchNumber(chars, from: cursor) {
+            return DiscToken(index: value, total: total, range: start..<end)
         }
-        // A single letter needs a separator; see the type comment.
-        if separatorCount > 0, let (value, end) = matchLetter(chars, from: cursor) {
-            return DiscToken(index: value, range: start..<end)
+        // A single letter needs a separator, and never follows `cd`; see the
+        // type comment.
+        if keyword.allowsLetterValue, separatorCount > 0,
+           let (value, end) = matchLetter(chars, from: cursor) {
+            return DiscToken(index: value, total: nil, range: start..<end)
         }
         return nil
     }
 
-    private static func matchKeyword(_ chars: [Character], at start: Int) -> Int? {
+    private static func matchKeyword(_ chars: [Character],
+                                     at start: Int) -> (end: Int, allowsLetterValue: Bool)? {
         for keyword in keywords {
-            guard start + keyword.count <= chars.count else { continue }
+            guard start + keyword.characters.count <= chars.count else { continue }
             var matched = true
-            for (offset, expected) in keyword.enumerated()
+            for (offset, expected) in keyword.characters.enumerated()
             where chars[start + offset].lowercased() != String(expected) {
                 matched = false
                 break
             }
-            if matched { return start + keyword.count }
+            if matched {
+                return (start + keyword.characters.count, keyword.allowsLetterValue)
+            }
         }
         return nil
     }
 
     /// A positive Arabic number plus an optional `of N` tail. Returns the disc
-    /// index and the end of the whole value.
-    private static func matchNumber(_ chars: [Character], from start: Int) -> (Int, Int)? {
+    /// index, the declared total when there was one, and the end of the value.
+    private static func matchNumber(_ chars: [Character],
+                                    from start: Int) -> (index: Int, total: Int?, end: Int)? {
         guard let (value, afterDigits) = matchDigits(chars, from: start), value > 0 else {
             return nil
         }
         // Trailing boundary: all consecutive ASCII digits were consumed, so any
         // alphanumeric still sitting here means the value ran into a word.
         if afterDigits < chars.count, isWordCharacter(chars[afterDigits]) { return nil }
-        if let end = matchOfCount(chars, from: afterDigits) { return (value, end) }
-        return (value, afterDigits)
+        if let (total, end) = matchOfCount(chars, from: afterDigits) {
+            return (value, total, end)
+        }
+        return (value, nil, afterDigits)
     }
 
     private static func matchDigits(_ chars: [Character], from start: Int) -> (Int, Int)? {
@@ -206,9 +220,11 @@ enum DiscTokenScanner {
         return (value, cursor)
     }
 
-    /// The optional `of N` tail of `Disk 1 of 3`. `of` that is not followed by
-    /// a number is title text and stays out of the token.
-    private static func matchOfCount(_ chars: [Character], from start: Int) -> Int? {
+    /// The optional `of N` tail of `Disk 1 of 3`, returning the declared total
+    /// and the end of the tail. `of` that is not followed by a number is title
+    /// text and stays out of the token.
+    private static func matchOfCount(_ chars: [Character],
+                                     from start: Int) -> (total: Int, end: Int)? {
         var cursor = start
         var separatorCount = 0
         while cursor < chars.count, separators.contains(chars[cursor]) {
@@ -224,7 +240,7 @@ enum DiscTokenScanner {
             return nil
         }
         if afterDigits < chars.count, isWordCharacter(chars[afterDigits]) { return nil }
-        return afterDigits
+        return (total, afterDigits)
     }
 
     /// One ASCII letter A–Z mapped onto 1–26.
@@ -246,8 +262,18 @@ enum DiscTokenScanner {
 /// game. Pure: no I/O, no paging, no fetching. The classifier yields ROM ids
 /// and file stems only.
 public enum PS1GameClassifier {
+    /// - Warning: A title whose own text ends in a disc-token shape is
+    ///   indistinguishable from a real disc token by filename alone, and the
+    ///   sequence rule only defends the singleton case. A demo series named
+    ///   `Neon Monthly Demo Disc 1 (USA)` / `… Disc 2 (USA)` under one meta id
+    ///   normalizes to the same base, is contiguous from 1, and contains the
+    ///   representative — so it **will** merge into a bogus two-disc game with
+    ///   an M3U. Two separately numbered products, one launch. Neither a
+    ///   filename rule nor RomM metadata distinguishes this case; the defense
+    ///   has to be in the UI. Task 10 should make the resolved disc set visible
+    ///   and let the player override it (launch a single disc).
     public static func classify(_ representative: Rom) -> PS1Game {
-        let stem = fileStem(forFSName: representative.fsName)
+        let stem = fileStem(for: representative)
         let siblings = deduplicated(representative.siblingRoms, excludingID: representative.id)
 
         // The representative must carry exactly one token before any merge is
@@ -261,6 +287,7 @@ public enum PS1GameClassifier {
         var discs = [PS1Disc(romID: representative.id, fileStem: stem,
                              index: representativeToken.index,
                              label: representativeToken.label)]
+        var declaredTotals: [Int] = representativeToken.total.map { [$0] } ?? []
         var excluded: [SiblingRom] = []
         for sibling in siblings {
             let siblingStem = sibling.fsNameNoExt
@@ -272,12 +299,14 @@ public enum PS1GameClassifier {
             }
             discs.append(PS1Disc(romID: sibling.id, fileStem: siblingStem,
                                  index: token.index, label: token.label))
+            if let total = token.total { declaredTotals.append(total) }
         }
         discs.sort { ($0.index, $0.romID) < ($1.index, $1.romID) }
 
         // Reject rather than guess: a partial set produces a game that cannot
         // boot, which is worse than treating the representative as single-disc.
-        guard isValidSequence(discs, containing: representative.id) else {
+        guard isValidSequence(discs, declaredTotals: declaredTotals,
+                              containing: representative.id) else {
             return singleDisc(representative, stem: stem, excluding: siblings)
         }
         return PS1Game(representative: representative,
@@ -286,9 +315,22 @@ public enum PS1GameClassifier {
                        excludedSiblings: excluded)
     }
 
+    /// The representative's stem, preferring RomM's own `fs_name_no_ext`.
+    ///
+    /// Siblings' stems are server-computed, so the representative's must be too
+    /// or the two sides can disagree and the merge silently fails. RomM does not
+    /// split on the last dot: for an extension-less folder ROM it returns
+    /// `fs_name_no_ext` identical to `fs_name`, dots and all. The local
+    /// computation below is only a fallback for servers that omit the field.
+    static func fileStem(for rom: Rom) -> String {
+        if let serverStem = rom.fsNameNoExt, !serverStem.isEmpty { return serverStem }
+        return fileStem(forFSName: rom.fsName)
+    }
+
     /// The name without its extension. Only a short, letter-bearing extension
     /// is stripped, so a folder-style `fs_name` carrying a version dot
-    /// (`… v1.1 (USA) (Disc 1)`) survives intact.
+    /// (`… v1.1 (USA) (Disc 1)`) survives intact. This is a heuristic and is
+    /// not identical to RomM's own rule — prefer `fileStem(for:)`.
     static func fileStem(forFSName fsName: String) -> String {
         guard let dot = fsName.lastIndex(of: "."), dot != fsName.startIndex else { return fsName }
         let ext = fsName[fsName.index(after: dot)...]
@@ -310,12 +352,25 @@ public enum PS1GameClassifier {
         return unique
     }
 
-    /// Starts at 1, unique contiguous indices, contains the representative.
-    private static func isValidSequence(_ discs: [PS1Disc], containing representativeID: Int) -> Bool {
+    /// Starts at 1, unique contiguous indices, contains the representative, and
+    /// does not contradict any `of N` total the filenames declared.
+    ///
+    /// The totals rule is the difference between "contiguous" and "complete":
+    /// `Disk 1 of 3` + `Disk 2 of 3` is contiguous from 1 and would otherwise
+    /// merge into a two-disc game for a three-disc title. Every declared total
+    /// must agree with every other and with the number of discs found.
+    private static func isValidSequence(_ discs: [PS1Disc], declaredTotals: [Int],
+                                        containing representativeID: Int) -> Bool {
+        // Holds by construction — `discs` is seeded with the representative and
+        // never filtered — but the rule is cheap to keep honest.
         guard !discs.isEmpty,
               discs.contains(where: { $0.romID == representativeID }) else { return false }
         for (offset, disc) in discs.enumerated() where disc.index != offset + 1 {
             return false
+        }
+        let declared = Set(declaredTotals)
+        if let total = declared.first {
+            guard declared.count == 1, total == discs.count else { return false }
         }
         return true
     }

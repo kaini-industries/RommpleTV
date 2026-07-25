@@ -36,6 +36,13 @@ public struct Rom: Identifiable, Decodable, Sendable {
     public let id: Int
     public let name: String?
     public let fsName: String
+    // Server-computed stem of `fsName`. RomM does *not* naively split on the
+    // last dot — for an extension-less (folder) ROM it returns this identical to
+    // `fs_name`, including for titles that contain dots. Any client-side stem
+    // computation therefore risks disagreeing with the `fs_name_no_ext` RomM
+    // reports for that same ROM's siblings, which silently breaks disc matching.
+    // Optional because older RomM builds may omit it from the list response.
+    public let fsNameNoExt: String?
     public let platformId: Int
     public let sizeBytes: Int64?
     // RomM returns a full resource path for the small cover thumbnail. This is
@@ -46,11 +53,15 @@ public struct Rom: Identifiable, Decodable, Sendable {
     // Scraped release regions (e.g. ["USA"]). Absent or unscraped roms decode to [].
     public let regions: [String]
 
+    // `fsNameNoExt` is last and defaulted so every existing memberwise call site
+    // keeps compiling unchanged.
     public init(id: Int, name: String?, fsName: String, platformId: Int, sizeBytes: Int64?,
-                coverPath: String?, siblingRoms: [SiblingRom] = [], regions: [String] = []) {
+                coverPath: String?, siblingRoms: [SiblingRom] = [], regions: [String] = [],
+                fsNameNoExt: String? = nil) {
         self.id = id
         self.name = name
         self.fsName = fsName
+        self.fsNameNoExt = fsNameNoExt
         self.platformId = platformId
         self.sizeBytes = sizeBytes
         self.coverPath = coverPath
@@ -59,7 +70,8 @@ public struct Rom: Identifiable, Decodable, Sendable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, name, fsName = "fs_name", platformId = "platform_id",
+        case id, name, fsName = "fs_name", fsNameNoExt = "fs_name_no_ext",
+             platformId = "platform_id",
              sizeBytes = "fs_size_bytes", coverPath = "path_cover_small",
              siblingRoms = "sibling_roms", regions
     }
@@ -69,6 +81,7 @@ public struct Rom: Identifiable, Decodable, Sendable {
         id = try c.decode(Int.self, forKey: .id)
         name = try c.decodeIfPresent(String.self, forKey: .name)
         fsName = try c.decode(String.self, forKey: .fsName)
+        fsNameNoExt = try c.decodeIfPresent(String.self, forKey: .fsNameNoExt)
         platformId = try c.decode(Int.self, forKey: .platformId)
         sizeBytes = try c.decodeIfPresent(Int64.self, forKey: .sizeBytes)
         coverPath = try c.decodeIfPresent(String.self, forKey: .coverPath)

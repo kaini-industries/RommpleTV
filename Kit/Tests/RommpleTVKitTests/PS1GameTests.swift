@@ -16,9 +16,13 @@ final class PS1GameTests: XCTestCase {
                    fsNameNoExt: stem, isMainSibling: main)
     }
 
-    private func rom(_ id: Int, _ fsName: String, siblings: [SiblingRom] = []) -> Rom {
+    /// `noExt` is RomM's own `fs_name_no_ext`. Left `nil` in most fixtures so the
+    /// local fallback stays covered; set explicitly where the server value is
+    /// the thing under test.
+    private func rom(_ id: Int, _ fsName: String, siblings: [SiblingRom] = [],
+                     noExt: String? = nil) -> Rom {
         Rom(id: id, name: nil, fsName: fsName, platformId: 33, sizeBytes: nil,
-            coverPath: nil, siblingRoms: siblings)
+            coverPath: nil, siblingRoms: siblings, fsNameNoExt: noExt)
     }
 
     private func index(_ stem: String) -> Int? {
@@ -58,13 +62,30 @@ final class PS1GameTests: XCTestCase {
         }
     }
 
-    func testLetterValuesMapOntoOneThroughTwentySix() {
-        XCTAssertEqual(index("Vault Runner (Disc A)"), 1)
-        XCTAssertEqual(index("Vault Runner (Disc B)"), 2)
-        XCTAssertEqual(index("Vault Runner (Disc C)"), 3)
-        XCTAssertEqual(index("Vault Runner (Disc Z)"), 26)
-        XCTAssertEqual(index("Vault Runner (Disc a)"), 1)
-        XCTAssertEqual(index("Vault Runner (Disc z)"), 26)
+    func testEveryLetterAToZMapsOntoOneThroughTwentySix() {
+        for (offset, letter) in "ABCDEFGHIJKLMNOPQRSTUVWXYZ".enumerated() {
+            XCTAssertEqual(index("Vault Runner (Disc \(letter))"), offset + 1, String(letter))
+            XCTAssertEqual(index("Vault Runner (Disk \(letter.lowercased()))"), offset + 1,
+                           letter.lowercased())
+        }
+    }
+
+    func testLetterValuesNeverFollowTheCDKeyword() {
+        // `CD-i`, `CD-R`, `CD-X` are product names, not disc numbers.
+        for stem in ["Vault Runner (CD-i Version)", "Vault Runner (CD-R Edition)",
+                     "Vault Runner (CD-X Remix)", "Vault Runner - CD A"] {
+            XCTAssertNil(DiscTokenScanner.soleToken(in: stem), stem)
+        }
+        // The numeric form after `cd` is untouched.
+        XCTAssertEqual(index("Vault Runner - CD-1"), 1)
+        XCTAssertEqual(index("Vault Runner - CD 2"), 2)
+    }
+
+    func testDeclaredTotalIsCarriedOnTheToken() {
+        XCTAssertEqual(DiscTokenScanner.soleToken(in: "Vault Runner (Disk 2 of 3)")?.total, 3)
+        XCTAssertEqual(DiscTokenScanner.soleToken(in: "Vault Runner (Disc 1 of 2)")?.total, 2)
+        XCTAssertNil(DiscTokenScanner.soleToken(in: "Vault Runner (Disc 1)")?.total)
+        XCTAssertNil(DiscTokenScanner.soleToken(in: "Vault Runner (Disc 1 of the Ancients)")?.total)
     }
 
     // MARK: - Token recognition: boundaries and rejections
@@ -94,6 +115,9 @@ final class PS1GameTests: XCTestCase {
             "Vault Runner (Rev 1)",
             "Vault Runner (Beta)",
             "Vault Runner (USA)",
+            "Vault Runner (CD-i Version)",           // product name, not a disc letter
+            "Vault Runner (CD-R Edition)",
+            "Vault Runner (CD-ROM Edition)",
         ]
         for stem in rejected {
             XCTAssertNil(DiscTokenScanner.soleToken(in: stem), stem)
@@ -142,6 +166,16 @@ final class PS1GameTests: XCTestCase {
                        base("chrono bastion (usa) - cd2"))
     }
 
+    // Pins the exact contract the relative assertions above rely on.
+    func testBaseProducesTheseExactStrings() {
+        XCTAssertEqual(base("Chrono Bastion (USA) (Disc 1)"), "chrono bastion (usa)")
+        XCTAssertEqual(base("Chrono Bastion (USA) - CD2"), "chrono bastion (usa)")
+        XCTAssertEqual(base("Chrono_Bastion_Disc_3"), "chrono_bastion")
+        XCTAssertEqual(base("Chrono Bastion (USA) (Rev 1) (Disk 2 of 3)"),
+                       "chrono bastion (usa) (rev 1)")
+        XCTAssertEqual(base("Chrono Bastion (USA) (Bonus Disc 1)"), "chrono bastion (usa) (bonus )")
+    }
+
     // MARK: - Classification: genuine disc sets
 
     func testTwoDiscGroupSortsNumerically() {
@@ -177,6 +211,36 @@ final class PS1GameTests: XCTestCase {
         XCTAssertEqual(game.discs.map(\.index), [1, 2, 3])
         XCTAssertEqual(game.discs.map(\.label), ["Disc 1", "Disc 2", "Disc 3"])
         XCTAssertEqual(game.canonicalRomID, 20)
+    }
+
+    func testIncompleteOfNSetCollapsesToSingleDisc() {
+        // Contiguous from 1, but the filenames say a third disc exists.
+        let rep = rom(300, "Vault Runner (USA) (Disk 1 of 3).chd",
+                      siblings: [sib(301, "Vault Runner (USA) (Disk 2 of 3)")])
+        let game = PS1GameClassifier.classify(rep)
+        XCTAssertEqual(game.discs.map(\.romID), [300],
+                       "two discs of a three-disc title must not merge")
+        XCTAssertEqual(game.discs.map(\.index), [1])
+        XCTAssertEqual(game.canonicalRomID, 300)
+        XCTAssertEqual(game.excludedSiblings.map(\.id), [301])
+    }
+
+    func testMismatchedOfNTotalsCollapseToSingleDisc() {
+        let rep = rom(310, "Vault Runner (USA) (Disk 1 of 2).chd",
+                      siblings: [sib(311, "Vault Runner (USA) (Disk 2 of 3)")])
+        let game = PS1GameClassifier.classify(rep)
+        XCTAssertEqual(game.discs.map(\.romID), [310])
+        XCTAssertEqual(game.excludedSiblings.map(\.id), [311])
+    }
+
+    func testATotalDeclaredOnOnlyOneDiscStillGoverns() {
+        let complete = rom(320, "Vault Runner (USA) (Disc 1 of 2).chd",
+                           siblings: [sib(321, "Vault Runner (USA) (Disc 2)")])
+        XCTAssertEqual(PS1GameClassifier.classify(complete).discs.map(\.romID), [320, 321])
+
+        let short = rom(330, "Vault Runner (USA) (Disc 1 of 3).chd",
+                        siblings: [sib(331, "Vault Runner (USA) (Disc 2)")])
+        XCTAssertEqual(PS1GameClassifier.classify(short).discs.map(\.romID), [330])
     }
 
     func testCDTokensSeparatedFromTitleText() {
@@ -443,5 +507,71 @@ final class PS1GameTests: XCTestCase {
         XCTAssertEqual(game.discs.map(\.index), [1, 2])
         XCTAssertEqual(game.discs.map(\.fileStem),
                        ["Chrono Bastion v1.1 (USA) (Disc 1)", "Chrono Bastion v1.1 (USA) (Disc 2)"])
+    }
+
+    // MARK: - Server-supplied stem
+
+    // RomM returns `fs_name_no_ext` identical to `fs_name` for extension-less
+    // folder roms, dots included. Siblings' stems always come from the server,
+    // so the representative's must too — a local stem that strips after the
+    // last dot disagrees with the sibling and the merge silently fails.
+    func testServerSuppliedStemWinsOverTheLocalGuess() {
+        // A folder rom whose name ends in a dotted acronym: RomM reports
+        // `fs_name_no_ext` identical to `fs_name`, the local heuristic cannot
+        // tell the last segment from an extension, and only the server is right.
+        let fsName = "Vault Runner - Operation S.W.A.T"
+        XCTAssertEqual(PS1GameClassifier.fileStem(forFSName: fsName),
+                       "Vault Runner - Operation S.W.A",
+                       "precondition: the local heuristic mangles this name")
+        let rep = rom(250, fsName, noExt: fsName)
+        XCTAssertEqual(PS1GameClassifier.fileStem(for: rep), fsName)
+        XCTAssertEqual(PS1GameClassifier.classify(rep).discs.map(\.fileStem), [fsName])
+    }
+
+    func testDottedTitleMergesOnServerSuppliedStems() {
+        let one = "Vault Runner - Operation S.W.A.T (USA) (Disc 1)"
+        let two = "Vault Runner - Operation S.W.A.T (USA) (Disc 2)"
+        let rep = rom(252, one, siblings: [sib(253, two)], noExt: one)
+        let game = PS1GameClassifier.classify(rep)
+        XCTAssertEqual(game.discs.map(\.index), [1, 2])
+        XCTAssertEqual(game.discs.map(\.romID), [252, 253])
+        XCTAssertEqual(game.discs.map(\.fileStem), [one, two], "dots must survive verbatim")
+        XCTAssertEqual(game.canonicalRomID, 252)
+    }
+
+    func testServerSuppliedStemIsUsedVerbatimForFileRoms() {
+        let rep = rom(260, "Chrono Bastion (USA) (Disc 1).cue",
+                      siblings: [sib(261, "Chrono Bastion (USA) (Disc 2)")],
+                      noExt: "Chrono Bastion (USA) (Disc 1)")
+        let game = PS1GameClassifier.classify(rep)
+        XCTAssertEqual(game.discs.map(\.fileStem),
+                       ["Chrono Bastion (USA) (Disc 1)", "Chrono Bastion (USA) (Disc 2)"])
+        XCTAssertEqual(game.discs.map(\.index), [1, 2])
+    }
+
+    func testLocalStemIsOnlyAFallback() {
+        // Server omitted the field: the local heuristic still strips `.cue` and
+        // still leaves a mid-name dot alone.
+        let rep = rom(270, "Vault Runner - Project S.C.A.R. (USA) (Disc 1).cue",
+                      siblings: [sib(271, "Vault Runner - Project S.C.A.R. (USA) (Disc 2)")])
+        let game = PS1GameClassifier.classify(rep)
+        XCTAssertEqual(game.discs.map(\.fileStem),
+                       ["Vault Runner - Project S.C.A.R. (USA) (Disc 1)",
+                        "Vault Runner - Project S.C.A.R. (USA) (Disc 2)"])
+        XCTAssertEqual(game.discs.map(\.index), [1, 2])
+    }
+
+    func testRomDecodesServerStem() throws {
+        let json = Data("""
+        {"id": 280, "name": "Vault Runner", "fs_name": "Vault Runner (USA) (Disc 1)",
+         "fs_name_no_ext": "Vault Runner (USA) (Disc 1)", "platform_id": 33}
+        """.utf8)
+        let decoded = try JSONDecoder().decode(Rom.self, from: json)
+        XCTAssertEqual(decoded.fsNameNoExt, "Vault Runner (USA) (Disc 1)")
+
+        let withoutField = Data("""
+        {"id": 281, "fs_name": "Vault Runner (USA).cue", "platform_id": 33}
+        """.utf8)
+        XCTAssertNil(try JSONDecoder().decode(Rom.self, from: withoutField).fsNameNoExt)
     }
 }
