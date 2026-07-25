@@ -70,9 +70,14 @@ final class EmulatorEngine: NSObject, CoreAVSink {
 
     enum EngineError: LocalizedError {
         case coreNotBundled(String)
-        /// The core would not take the saved card: `cardBytes` on disk against
-        /// `coreBytes` of SAVE_RAM. Carries both numbers because they are the
-        /// whole diagnosis and neither is private — no name, no path, no server.
+        /// A **server-backed** card whose size the core disagrees with:
+        /// `cardBytes` on disk against `coreBytes` of SAVE_RAM. Carries both
+        /// numbers because they are the whole diagnosis and neither is private —
+        /// no name, no path, no server.
+        ///
+        /// Only ever raised for a launch that has a card on RomM. A local-only
+        /// card that disagrees is restored as far as it fits and played; see
+        /// `RestoredCardDecision`.
         case savedCardRejected(coreBytes: Int, cardBytes: Int)
 
         var errorDescription: String? {
@@ -80,18 +85,19 @@ final class EmulatorEngine: NSObject, CoreAVSink {
             case .coreNotBundled(let name):
                 return "Core \(name).dylib is not in this build "
                      + "(simulator builds have no cores — run on the Apple TV)."
-            case let .savedCardRejected(coreBytes, cardBytes) where coreBytes == 0:
-                return "There's a saved card for this game (\(cardBytes) bytes), but the "
-                     + "emulator core isn't offering anywhere to put it. RommpleTV stopped "
-                     + "rather than start the game as if the save wasn't there. Launching "
-                     + "again is safe and will say the same thing until the core and the "
-                     + "card agree."
             case let .savedCardRejected(coreBytes, cardBytes):
-                return "The saved card for this game is \(cardBytes) bytes and the emulator "
-                     + "core expects \(coreBytes), so it couldn't be loaded. RommpleTV "
-                     + "stopped rather than start the game on a blank card and then save "
-                     + "that over the one you have. Launching again is safe and will say "
-                     + "the same thing until the core and the card agree."
+                // No remedy is offered because there is none inside the app: the
+                // card cannot be cleared from here, and launching again reads the
+                // same card into the same core. Saying so is better than sending
+                // the player round a loop — and what it protects is worth the
+                // dead end, since the alternative is that this game's memory card
+                // stops being the newest one on the server.
+                return "The memory card saved for this game is \(cardBytes) bytes and the "
+                     + "emulator core expects \(coreBytes), so it couldn't be loaded. "
+                     + "RommpleTV stopped rather than start the game on a blank card and "
+                     + "then save that over the one you have. Launching again will say the "
+                     + "same thing: nothing on this Apple TV can make the two agree, and "
+                     + "the card is safe where it is."
             }
         }
     }
@@ -126,6 +132,7 @@ final class EmulatorEngine: NSObject, CoreAVSink {
         core.sink = self
 
         let restored: Data?
+        var restoreOutcome: RAMRestoreOutcome = .noSaveRAM
         do {
             try core.loadGame(at: launch.entryURL)
             // A read failure is propagated rather than swallowed: treating an
@@ -134,31 +141,39 @@ final class EmulatorEngine: NSObject, CoreAVSink {
             // It reaches the player as the "Can't start emulation" screen, which
             // offers a way back to the library and leaves the card untouched.
             restored = try launch.saveStore.load(romID: launch.canonicalRomID)
-            // And a *refused* restore is the same defect one step later, which is
-            // why it is a launch failure and not a state to play through.
-            // `restoreRAM` returns false without writing when the core's SAVE_RAM
-            // is a different size — so the core keeps its power-on card, the
-            // first periodic flush reads that card, sees it differs from the
-            // bytes on disk, and writes it over them. On a PlayStation launch the
-            // upload follows: `EmulatorSaveFlow` schedules it, the blank matches
-            // the baseline the reconcile recorded, so the coordinator takes the
-            // ordinary append branch rather than the conflict one and makes the
-            // blank card the newest version on the server. Nothing archives.
+            // What the core did with those bytes is a decision, not a detail, and
+            // the decision is `RestoredCardDecision` — in the Kit, next to the
+            // rest of the save ordering, where it can be tested without a core, a
+            // display link and an audio engine. Both halves of it matter:
             //
-            // This became reachable with PlayStation and not before: until the
-            // card could arrive from RomM, the only writer of these bytes was
-            // this device's own core and a size disagreement was impossible. Now
-            // a second Apple TV on a different build — or this one after a core
-            // bump that changes memory-card configuration — produces it.
+            // A size disagreement on a **server-backed** card is the loss path
+            // this check exists for. The core keeps its power-on card, the first
+            // periodic flush writes that over the bytes on disk, and the upload
+            // that follows still matches the baseline the reconcile recorded — so
+            // the coordinator takes its ordinary append branch rather than the
+            // conflict branch and makes a card nobody played the newest version
+            // on the server, archiving nothing.
+            //
+            // A size disagreement on a **local-only** card is ordinary and must
+            // start: mGBA reports its SAVE_RAM size before it has detected one, so
+            // every GBA launch after the first disagrees with the card it wrote
+            // itself. Refusing that would make most of the GBA library
+            // unlaunchable for good, and there is nothing to demote — the local
+            // card is the only copy.
             //
             // Throwing from inside the `do` runs the same `core.unload()` every
             // other start failure does and reaches the player as "Can't start
             // emulation", whose promise that "Nothing was changed on this Apple
             // TV or on your RomM server" is exactly true here: `saveFlow` is
             // still nil, so the `stop()` that follows has nothing to flush.
-            if let restored, !core.restoreRAM(restored) {
-                throw EngineError.savedCardRejected(coreBytes: core.saveRAM()?.count ?? 0,
-                                                    cardBytes: restored.count)
+            if let restored {
+                restoreOutcome = core.restoreRAM(restored)
+                if case let .refuse(coreBytes, cardBytes) =
+                    RestoredCardDecision.decide(restoreOutcome,
+                                                hasRemoteCard: launch.saveStatuses != nil) {
+                    throw EngineError.savedCardRejected(coreBytes: coreBytes,
+                                                        cardBytes: cardBytes)
+                }
             }
         } catch {
             // A constructed core owns the process-wide gCore slot; failing to
@@ -169,11 +184,15 @@ final class EmulatorEngine: NSObject, CoreAVSink {
         self.core = core
         self.launch = launch
         // Freshly restored data already matches disk — don't re-flush it on the
-        // very first 600-tick boundary. Only ever reached when the core took the
-        // bytes: setting this from a refused restore is what turned a mismatch
-        // into a silent overwrite, and not setting it would not have helped
-        // either — the first flush overwrites regardless.
-        if let restored { lastFlushedSRAM = restored }
+        // very first 600-tick boundary.
+        //
+        // Only on an exact restore, and that is the point: after a partial one
+        // the core is holding something the card on disk demonstrably is not, so
+        // recording "these bytes are already saved" would be a lie. Left `nil`,
+        // the first flush writes what the core actually holds and disk catches up
+        // with it. Setting it from a restore the core had *refused* is what turned
+        // a size disagreement into a silent overwrite in the first place.
+        if case .exact = restoreOutcome { lastFlushedSRAM = restored }
         // The whole remote half of the save session, in four lines and in one
         // place. `onLocalSave` hands the uploader bytes that are already on disk
         // and lets its debounce decide when they go out; `retrySaveSync` is the

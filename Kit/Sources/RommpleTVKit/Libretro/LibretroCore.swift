@@ -25,16 +25,38 @@ public protocol CoreAVSink: AnyObject {
 /// directly, so renumbering a case silently remaps a button.
 ///
 /// All sixteen ids, including the four no cartridge system this app ships has
-/// any use for. `retro_set_controller_port_device(0, RETRO_DEVICE_JOYPAD)` tells
-/// Beetle PSX it is talking to a PlayStation Controller, so it polls ids 12-15
-/// every frame whatever the frontend does about them — and an id with no case
-/// is a button that reads 0 for the life of the install, with no error anywhere
-/// and no test that can press it. A large part of the PlayStation library puts
-/// camera control, weapon cycling and menu paging on L2/R2.
+/// any use for. An id with no case is a button that reads 0 for the life of the
+/// install, with no error anywhere and no test that can press it — which is what
+/// L2 and R2 were: `retro_set_controller_port_device(0, RETRO_DEVICE_JOYPAD)`
+/// tells Beetle PSX it is talking to a PlayStation Controller, and a large part
+/// of that library puts camera control, weapon cycling and menu paging on them.
+///
+/// `RETRO_DEVICE_JOYPAD` specifically instantiates the **digital** SCPH-1080,
+/// which has L2/R2 and no stick clicks at all — so ids 14 and 15 are expected to
+/// be inert on PlayStation however faithfully the frontend sends them. They are
+/// cases here because the enum is libretro's id space rather than one core's
+/// pad, and because a core reached under a different device type would use them.
 public enum RetroButton: Int32, CaseIterable, Sendable {
     case b = 0, y = 1, select = 2, start = 3, up = 4, down = 5, left = 6,
          right = 7, a = 8, x = 9, l = 10, r = 11, l2 = 12, r2 = 13,
          l3 = 14, r3 = 15
+}
+
+/// What `LibretroCore.restoreRAM` did with the bytes it was handed.
+///
+/// Three outcomes rather than a `Bool`, because "the core took every byte" and
+/// "the core took what fitted" are the same event to the emulator and different
+/// events to a memory card that came off a server. See `RestoredCardDecision`,
+/// which is where the difference is turned into a decision.
+public enum RAMRestoreOutcome: Equatable, Sendable {
+    /// The sizes agreed and every byte went in.
+    case exact
+    /// The core exposes no SAVE_RAM for this game — there was nowhere to put
+    /// anything and nothing was written. A cartridge with no battery, and the
+    /// state in which `saveRAM()` returns `nil` and no flush ever writes.
+    case noSaveRAM
+    /// The sizes disagreed and `min` bytes went into the front of the buffer.
+    case partial(coreBytes: Int, cardBytes: Int)
 }
 
 public enum CoreError: Error {
@@ -487,23 +509,30 @@ public final class LibretroCore {
 
     /// Restores battery RAM. Call AFTER loadGame.
     ///
-    /// - Returns: `false` when the core did **not** take the bytes — either its
-    ///   SAVE_RAM is a different size from `data`, or it exposes none at all. In
-    ///   neither case has anything been written.
+    /// Copies into the front of the core's buffer, `min(data.count, size)` bytes,
+    /// which is what RetroArch and every other frontend does — and it is not
+    /// leniency for its own sake. A core is allowed to report a SAVE_RAM size at
+    /// load that is not the size it will report later: mGBA answers
+    /// `GBA_SIZE_FLASH1M` (131072) for the whole of `retro_load_game`, because
+    /// `savedata.type` is still `AUTODETECT` and the real load is deferred to the
+    /// first `retro_run`. The detected size — 32768 SRAM, 65536 FLASH512, 8192 or
+    /// 512 EEPROM — only appears afterwards. An exact-size restore therefore
+    /// refuses every GBA card this app ever wrote except FLASH1M, since the card
+    /// on disk was written at *flush* time with the detected size.
     ///
-    /// Deliberately not `@discardableResult`. A refused restore is not a state to
-    /// play through: the core is left holding whatever it powered on with, and a
-    /// caller that ignores the answer will flush *that* over the card it just
-    /// failed to load. Size disagreement used to be impossible — the only source
-    /// of `.srm` bytes was this device's own core — and is not any more, now that
-    /// a card can arrive from RomM having been written by another Apple TV or by
-    /// a core built with a different memory-card configuration.
-    public func restoreRAM(_ data: Data) -> Bool {
+    /// - Returns: which of those three things happened. Deliberately not
+    ///   `@discardableResult`: `partial` is fine for a card that only this device
+    ///   has ever written and is a data-loss path for one that arrived from a
+    ///   server, and only the caller knows which it is holding.
+    ///   See `RestoredCardDecision`.
+    public func restoreRAM(_ data: Data) -> RAMRestoreOutcome {
         let size = fnGetMemorySize(Self.memorySaveRAM)
-        guard size == data.count, size > 0,
-              let ptr = fnGetMemoryData(Self.memorySaveRAM) else { return false }
-        data.withUnsafeBytes { ptr.copyMemory(from: $0.baseAddress!, byteCount: size) }
-        return true
+        guard size > 0, let ptr = fnGetMemoryData(Self.memorySaveRAM) else { return .noSaveRAM }
+        let copied = min(size, data.count)
+        if copied > 0 {
+            data.withUnsafeBytes { ptr.copyMemory(from: $0.baseAddress!, byteCount: copied) }
+        }
+        return size == data.count ? .exact : .partial(coreBytes: size, cardBytes: data.count)
     }
 
     public func setButton(_ button: RetroButton, pressed: Bool) {

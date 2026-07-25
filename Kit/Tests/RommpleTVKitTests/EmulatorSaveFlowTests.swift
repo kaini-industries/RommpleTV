@@ -282,6 +282,45 @@ final class EmulatorSaveFlowTests: XCTestCase {
         }
     }
 
+    // MARK: Starting on a card the core sized differently
+
+    /// The whole table, both launch kinds against all three outcomes, because the
+    /// two halves fail in opposite directions and each one's failure is invisible
+    /// on the other's path.
+    func testOnlyAServerBackedCardRefusesOnASizeDisagreement() {
+        let mismatch = RAMRestoreOutcome.partial(coreBytes: 131072, cardBytes: 65536)
+        for hasRemoteCard in [true, false] {
+            XCTAssertEqual(RestoredCardDecision.decide(.exact, hasRemoteCard: hasRemoteCard),
+                           .start)
+            XCTAssertEqual(RestoredCardDecision.decide(.noSaveRAM, hasRemoteCard: hasRemoteCard),
+                           .start,
+                           "a core with no SAVE_RAM overwrites nothing — flushSRAMIfNeeded "
+                               + "returns early on a nil saveRAM() — so refusing it strands "
+                               + "a game for no protection at all")
+        }
+        XCTAssertEqual(RestoredCardDecision.decide(mismatch, hasRemoteCard: false), .start,
+                       "a local-only card that disagrees must still start: mGBA reports "
+                           + "FLASH1M until the deferred load detects a size, so every GBA "
+                           + "launch after the first disagrees with the card it wrote itself")
+        XCTAssertEqual(RestoredCardDecision.decide(mismatch, hasRemoteCard: true),
+                       .refuse(coreBytes: 131072, cardBytes: 65536),
+                       "a card that is also on a server must not be played past: the first "
+                           + "flush writes the core's card over it and the upload that "
+                           + "follows appends rather than conflicts")
+    }
+
+    /// The GBA sizes, spelled out, because this is the case the strict rule broke
+    /// and the numbers are the reason. `retro_get_memory_size` answers
+    /// `GBA_SIZE_FLASH1M` while `savedata.type` is `AUTODETECT`, and the card on
+    /// disk was written after detection.
+    func testEveryGBASaveSizeStartsOnALocalOnlyLaunch() {
+        for detected in [32768, 65536, 8192, 512] {
+            let outcome = RAMRestoreOutcome.partial(coreBytes: 131072, cardBytes: detected)
+            XCTAssertEqual(RestoredCardDecision.decide(outcome, hasRemoteCard: false), .start,
+                           "a \(detected)-byte GBA card would be unlaunchable for good")
+        }
+    }
+
     // MARK: The trigger table
 
     /// Every trigger except the tick asks for an immediate sync, and the tick

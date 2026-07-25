@@ -148,6 +148,62 @@ public struct EmulatorRemoteSaveRequest: Sendable, Equatable {
     }
 }
 
+/// Whether a game may start after the core answered `restoreRAM`.
+///
+/// ## Why this is a decision and not an assertion
+///
+/// A disagreement between the card on disk and the core's SAVE_RAM size is
+/// *ordinary* on one path and a data-loss path on the other, and the difference
+/// is not the sizes — it is where the bytes came from.
+///
+/// **A card only this device has ever written can be restored partially and
+/// played.** It has to be: a core may report one SAVE_RAM size at load and
+/// another later. mGBA reports `GBA_SIZE_FLASH1M` (131072) for the whole of
+/// `retro_load_game` — `savedata.type` is `AUTODETECT` until the deferred load
+/// runs inside the first `retro_run` — while the card on disk was written at
+/// flush time with the *detected* size (32768, 65536, 8192, 512). So every GBA
+/// launch after the first sees a mismatch, every time, and refusing it would make
+/// every non-FLASH1M GBA game unlaunchable for the life of the install. Copying
+/// what fits is what RetroArch does and is what makes the deferred sizing work.
+/// Nothing is lost by playing on: the card is local, there is no other copy of it
+/// to demote, and the next flush writes what the core actually holds.
+///
+/// **A card that arrived from a server may not.** That is the path where a
+/// mismatch destroys something. The engine flushes the core's card ~10 seconds
+/// in; because the blank still matches the baseline the reconcile recorded, the
+/// coordinator takes its ordinary append branch rather than the conflict branch,
+/// and the newest version on the server becomes a card nobody played. Nothing
+/// archives. The real card survives only as an older row in a 10-deep window the
+/// app never surfaces — so the disagreement has to stop the launch, before the
+/// engine has a save flow to schedule anything with.
+///
+/// `noSaveRAM` starts on both paths. It is not a loss path at all:
+/// `flushSRAMIfNeeded` guards on `saveRAM()` and returns early when the core
+/// exposes none, so nothing is ever written over anything. Refusing it would
+/// strand a game behind a screen whose only remedy is one the player cannot
+/// carry out.
+public enum RestoredCardDecision: Equatable, Sendable {
+    /// Start the game.
+    case start
+    /// Refuse the launch. The two numbers are the whole diagnosis and neither is
+    /// private — no name, no path, no server.
+    case refuse(coreBytes: Int, cardBytes: Int)
+
+    /// - Parameter hasRemoteCard: whether this launch's card is also on a server.
+    ///   `PreparedLaunch.saveStatuses != nil` is the same question: a launch with
+    ///   a status stream is one with a coordinator behind it, and a launch
+    ///   without one has no server-side copy of anything.
+    public static func decide(_ outcome: RAMRestoreOutcome,
+                              hasRemoteCard: Bool) -> RestoredCardDecision {
+        switch outcome {
+        case .exact, .noSaveRAM:
+            return .start
+        case let .partial(coreBytes, cardBytes):
+            return hasRemoteCard ? .refuse(coreBytes: coreBytes, cardBytes: cardBytes) : .start
+        }
+    }
+}
+
 // MARK: - The flow
 
 /// The order in which a game's save reaches disk and then the server, and the

@@ -316,10 +316,24 @@ final class LibretroCoreTests: XCTestCase {
         // Mutate a copy, restore it, and read it back.
         var mutated = sram
         mutated[0] = mutated[0] &+ 1
-        XCTAssertTrue(core.restoreRAM(mutated))
+        XCTAssertEqual(core.restoreRAM(mutated), .exact)
         XCTAssertEqual(core.saveRAM()?[0], mutated[0])
-        // Wrong-size restore must be rejected, not crash.
-        XCTAssertFalse(core.restoreRAM(Data([1, 2, 3])))
+        // A short card goes into the front of the buffer and reports what it did,
+        // rather than being dropped: a core may report one SAVE_RAM size at load
+        // and another after it has detected the real one (mGBA does exactly
+        // this), so an exact-size-only restore refuses cards it wrote itself.
+        XCTAssertEqual(core.restoreRAM(Data([1, 2, 3])),
+                       .partial(coreBytes: sram.count, cardBytes: 3))
+        XCTAssertEqual(Array(core.saveRAM()!.prefix(3)), [1, 2, 3])
+        XCTAssertEqual(core.saveRAM()?.count, sram.count,
+                       "a short restore must not resize the core's buffer")
+        // And a card longer than the buffer is truncated into it, not past it.
+        XCTAssertEqual(core.restoreRAM(Data(repeating: 0xAB, count: sram.count + 64)),
+                       .partial(coreBytes: sram.count, cardBytes: sram.count + 64))
+        XCTAssertEqual(core.saveRAM(), Data(repeating: 0xAB, count: sram.count))
+        // An empty card must not trap on the copy.
+        XCTAssertEqual(core.restoreRAM(Data()),
+                       .partial(coreBytes: sram.count, cardBytes: 0))
     }
 
     func testResetGameContinuesRunning() throws {
