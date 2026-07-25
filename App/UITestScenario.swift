@@ -26,6 +26,10 @@ enum UITestScenario: String, CaseIterable {
     /// A disc set the classifier merged, so the disc list and its override are
     /// on screen.
     case discs
+    /// A pause overlay whose local card refuses to be written, so the failure a
+    /// player sees, the Quit it blocks, and the Retry Save that finally clears it
+    /// are all on screen.
+    case saveFailure
 
     static let argument = "-ui-test-scenario"
 
@@ -57,7 +61,18 @@ struct UITestScenarioView: View {
                 Button("Launch") { path = [0] }
                     .accessibilityIdentifier("fixture.launch")
             }
-            .navigationDestination(for: Int.self) { _ in preparation }
+            .navigationDestination(for: Int.self) { _ in destination }
+        }
+    }
+
+    @ViewBuilder
+    private var destination: some View {
+        if scenario == .saveFailure {
+            // The one scenario that is about a game already running rather than
+            // one being prepared.
+            UITestSaveFailureView(onQuit: { path = [] })
+        } else {
+            preparation
         }
     }
 
@@ -76,6 +91,80 @@ struct UITestScenarioView: View {
                     .accessibilityIdentifier("fixture.entry")
             }
         }
+    }
+}
+
+// MARK: - The save-failure overlay
+
+/// The real `PauseOverlayView`, driven by the real `EmulatorSaveFlow` over a card
+/// that refuses to be written.
+///
+/// This is as close to the shipping path as a simulator gets. `EmulatorEngine`
+/// needs a core dylib that simulator builds do not have, so this view supplies
+/// the two things the engine supplies — a synchronous local write, and a remote
+/// schedule that does nothing — and takes the same three decisions the host view
+/// takes: retry with `.user`, quit with `.quit`, and leave only when the flush
+/// says the card is on disk. The engine's own half is covered by
+/// `EmulatorSaveFlowTests`, which can run the state machine without any of this.
+///
+/// The card refuses its first two writes and accepts everything after, so the
+/// sequence a test drives — the failure appears, Quit is refused, Retry Save
+/// lands, Quit leaves — is deterministic without a button that exists only to
+/// heal it.
+@MainActor
+private struct UITestSaveFailureView: View {
+    let onQuit: () -> Void
+
+    @StateObject private var flow: EmulatorSaveFlow
+    @State private var didArrive = false
+
+    init(onQuit: @escaping () -> Void) {
+        self.onQuit = onQuit
+        let card = FixtureRefusingCard()
+        _flow = StateObject(wrappedValue: EmulatorSaveFlow(
+            localFlush: { try card.write() },
+            scheduleRemote: { _ in }))
+    }
+
+    var body: some View {
+        Group {
+            if didArrive {
+                PauseOverlayView(
+                    saveFailure: flow.failure,
+                    onResume: {},
+                    onRestart: {},
+                    onRetrySave: { _ = flow.flush(.user) },
+                    onQuit: { if case .saved = flow.flush(.quit) { onQuit() } })
+            } else {
+                Color.black.ignoresSafeArea()
+            }
+        }
+        .onAppear {
+            // The periodic flush that failed and put this overlay up — and it
+            // runs *before* the overlay exists, which is the shipping order:
+            // `EmulatorEngine` publishes the failure and only then asks the host
+            // to show the overlay, so the overlay opens with the message already
+            // there and its focus lands on the remedy. Guarded because a
+            // re-appearance must not consume another of the card's refusals.
+            guard !didArrive else { return }
+            _ = flow.flush(.periodic)
+            didArrive = true
+        }
+    }
+}
+
+/// A card that refuses the first two writes. Invented bytes, no filesystem.
+private final class FixtureRefusingCard: @unchecked Sendable {
+    private let lock = NSLock()
+    private var attempts = 0
+
+    struct Refused: Error {}
+
+    func write() throws -> Data? {
+        lock.lock(); defer { lock.unlock() }
+        attempts += 1
+        if attempts <= 2 { throw Refused() }
+        return Data("fixture-card".utf8)
     }
 }
 
