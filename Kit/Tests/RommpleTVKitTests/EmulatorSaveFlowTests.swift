@@ -261,11 +261,21 @@ final class EmulatorSaveFlowTests: XCTestCase {
 
     /// The two messages are not interchangeable: one is about progress the player
     /// still has, the other about a session that is over.
+    ///
+    /// The note's message may not claim to be about the *previous* session. It is
+    /// retired by being shown and by nothing else, so a failure in session 1 that
+    /// the player never opened an overlay to see is still waiting in session 4
+    /// with sessions 2 and 3 having ended cleanly in between. "An earlier
+    /// session" is true of every sequence that can reach it; "the last time you
+    /// played" is false of that one.
     func testTheTwoSaveMessagesSayDifferentThings() {
         XCTAssertNotEqual(EmulatorSaveFailure.localWriteFailed,
                           EmulatorSaveFailure.lastSessionUnwritten)
-        XCTAssertTrue(EmulatorSaveFailure.lastSessionUnwritten.message.contains("last time"),
+        XCTAssertTrue(EmulatorSaveFailure.lastSessionUnwritten.message.contains("earlier session"),
                       EmulatorSaveFailure.lastSessionUnwritten.message)
+        XCTAssertFalse(EmulatorSaveFailure.lastSessionUnwritten.message.contains("last time"),
+                       "the note claims to be about the previous session, and it is not: "
+                           + "nothing retires it but being shown")
         for failure in [EmulatorSaveFailure.localWriteFailed, .lastSessionUnwritten] {
             XCTAssertTrue(failure.recovery.contains("Retry Save"), failure.recovery)
             XCTAssertFalse(failure.message.contains("/"), failure.message)

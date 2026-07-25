@@ -64,9 +64,15 @@ public struct EmulatorSaveFailure: Error, LocalizedError, Equatable, Sendable {
     /// different sentence because it is about a different session: the progress
     /// it names is already gone, and what the player can still do something
     /// about is this one.
+    ///
+    /// "An earlier session" rather than "the last time you played", which was
+    /// false in a reachable sequence: the note is retired by being *shown* and by
+    /// nothing else, so a failure in session 1 that never reached an overlay is
+    /// still waiting in session 4 — with sessions 2 and 3 having saved perfectly
+    /// well in between. The retire-by-showing rule is deliberate (see
+    /// `UnwrittenCardNote`); this is the wording catching up with it.
     public static let lastSessionUnwritten = EmulatorSaveFailure(
-        message: "The last time you played this game, RommpleTV could not save it on this "
-            + "Apple TV.",
+        message: "An earlier session of this game could not be saved on this Apple TV.",
         recovery: "Choose Retry Save to write this game's save now. If it fails again, restart "
             + "RommpleTV before playing on.")
 }
