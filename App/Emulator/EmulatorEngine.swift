@@ -68,25 +68,31 @@ final class EmulatorEngine: NSObject, CoreAVSink {
         let core = try LibretroCore(dylibPath: "\(fwPath)/\(coreName).dylib",
                                     systemDirectory: systemDir, saveDirectory: saveDir)
         core.sink = self
+
+        // Same Caches root the core's own system/save dirs live under.
+        let saveStore = BatterySaveStore(cachesRoot: support)
+        let restored: Data?
         do {
             try core.loadGame(at: romURL)
+            // A read failure is propagated rather than swallowed: treating an
+            // unreadable save as a missing one starts the game on a blank
+            // battery and the next flush writes that blank over the real one.
+            // Task 11 turns this into a message a player can act on.
+            restored = try saveStore.load(romID: romID)
         } catch {
             // A constructed core owns the process-wide gCore slot; failing to
-            // load must release it or no game can ever start until relaunch.
+            // start must release it or no game can ever start until relaunch.
             core.unload()
             throw error
         }
         self.core = core
         self.romID = romID
-
-        // Same Caches root the core's own system/save dirs live under.
-        let saveStore = BatterySaveStore(cachesRoot: support)
         self.saveStore = saveStore
-        if let sram = saveStore.load(romID: romID) {
-            core.restoreRAM(sram)
+        if let restored {
+            core.restoreRAM(restored)
             // Freshly restored data already matches disk — don't re-flush it
             // on the very first 600-tick boundary.
-            lastFlushedSRAM = sram
+            lastFlushedSRAM = restored
         }
 
         if let av = core.avInfo {
@@ -170,11 +176,21 @@ final class EmulatorEngine: NSObject, CoreAVSink {
     /// Writes battery RAM to the store only if it changed since the last
     /// flush (avoids redundant Caches writes every ~10s for games with no
     /// battery-backed save, or one whose save hasn't changed).
+    ///
+    /// `lastFlushedSRAM` moves only after the write returns. Advancing it on a
+    /// failed write would mark the dirty bytes as already saved, and the next
+    /// flush would see "nothing changed" and skip the retry — one failed write
+    /// would silently become a lost save.
     private func flushSRAMIfNeeded() {
         guard let core, let saveStore, let romID, let sram = core.saveRAM() else { return }
         if let last = lastFlushedSRAM, last == sram { return }
-        saveStore.save(sram, romID: romID)
-        lastFlushedSRAM = sram
+        do {
+            try saveStore.save(sram, romID: romID)
+            lastFlushedSRAM = sram
+        } catch {
+            // Keep the dirty value so the next flush tries again. Task 11 adds
+            // the user-visible failure.
+        }
     }
 
     private func startAudio(sampleRate: Double) {

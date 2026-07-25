@@ -689,6 +689,150 @@ final class RommClientTests: XCTestCase {
         XCTAssertEqual(archiveQuery["overwrite"], "false")
     }
 
+    // MARK: - Device registration
+
+    func testDevicesDecodesRegisteredDevices() async throws {
+        // RomM's DeviceSchema. `id` is a UUID *string* the server issued — the
+        // value `device_id` query parameters refer to — and unmodeled extras must
+        // not break the decode.
+        let json = Data("""
+        [
+          {"id": "3f7c1c0e-0000-4000-8000-000000000001", "user_id": 1,
+           "name": "Living Room", "platform": "tvOS", "client": "RommpleTV",
+           "client_version": "1.0", "ip_address": null, "mac_address": null,
+           "hostname": "rommpletv-aaaa", "client_device_identifier": null,
+           "sync_mode": "api", "sync_enabled": true, "sync_config": null,
+           "last_seen": "2026-03-01T10:00:00Z", "created_at": "2026-03-01T09:00:00Z",
+           "updated_at": "2026-03-01T10:00:00Z"},
+          {"id": "3f7c1c0e-0000-4000-8000-000000000002", "user_id": 1,
+           "name": null, "platform": null, "client": null, "client_version": null,
+           "ip_address": null, "mac_address": null, "hostname": null,
+           "client_device_identifier": "some-other-client",
+           "sync_mode": "api", "sync_enabled": true, "sync_config": null,
+           "last_seen": null, "created_at": "2026-03-01T09:00:00Z",
+           "updated_at": "2026-03-01T10:00:00Z"}
+        ]
+        """.utf8)
+        var capturedURL: URL?
+        var capturedAuth: String?
+        StubProtocol.responder = { req in
+            capturedURL = req.url
+            capturedAuth = req.value(forHTTPHeaderField: "Authorization")
+            return (200, json)
+        }
+        let devices = try await makeClient().devices()
+
+        let url = try XCTUnwrap(capturedURL)
+        XCTAssertEqual(url.path, "/api/devices")
+        XCTAssertNil(url.query)
+        XCTAssertEqual(capturedAuth, "Bearer not-a-secret")
+
+        XCTAssertEqual(devices.count, 2)
+        XCTAssertEqual(devices[0].id, "3f7c1c0e-0000-4000-8000-000000000001")
+        XCTAssertEqual(devices[0].hostname, "rommpletv-aaaa")
+        XCTAssertEqual(devices[0].platform, "tvOS")
+        XCTAssertEqual(devices[0].name, "Living Room")
+        XCTAssertNil(devices[0].clientDeviceIdentifier)
+        // A device registered by some other client decodes with everything nil
+        // rather than failing the whole list.
+        XCTAssertNil(devices[1].hostname)
+        XCTAssertEqual(devices[1].clientDeviceIdentifier, "some-other-client")
+    }
+
+    func testRegisterDeviceSendsFingerprintAsJSONAndDecodesDeviceID() async throws {
+        let json = Data("""
+        {"device_id": "3f7c1c0e-0000-4000-8000-000000000001", "name": "RommpleTV",
+         "created_at": "2026-03-01T09:00:00Z"}
+        """.utf8)
+        var captured: URLRequest?
+        StubProtocol.responder = { req in
+            captured = req
+            return (201, json)
+        }
+        let registration = try await makeClient().registerDevice(
+            name: "RommpleTV", platform: "tvOS", client: "RommpleTV",
+            clientVersion: "2b", hostname: "rommpletv-aaaa")
+        XCTAssertEqual(registration.deviceID, "3f7c1c0e-0000-4000-8000-000000000001")
+
+        let request = try XCTUnwrap(captured)
+        XCTAssertEqual(request.httpMethod, "POST")
+        let url = try XCTUnwrap(request.url)
+        XCTAssertEqual(url.path, "/api/devices")
+        XCTAssertNil(url.query, "the payload is a JSON body, not query parameters")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
+
+        let body = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: requestBody(request)) as? [String: Any])
+        XCTAssertEqual(body["name"] as? String, "RommpleTV")
+        XCTAssertEqual(body["platform"] as? String, "tvOS")
+        XCTAssertEqual(body["client"] as? String, "RommpleTV")
+        XCTAssertEqual(body["client_version"] as? String, "2b")
+        XCTAssertEqual(body["hostname"] as? String, "rommpletv-aaaa")
+        // `hostname` + `platform` is the fingerprint RomM dedups on, and
+        // allow_existing is what makes a repeat registration return the same
+        // device instead of 409ing.
+        XCTAssertEqual(body["allow_existing"] as? Bool, true)
+        // A second device row per launch would make every earlier sync record
+        // invisible, and re-registering must never wipe the sync rows that stop
+        // the slot-409 firing on every upload.
+        XCTAssertNotEqual(body["allow_duplicate"] as? Bool, true)
+        XCTAssertNotEqual(body["reset_syncs"] as? Bool, true)
+        // A synthesized MAC would take priority over the hostname fingerprint
+        // and is not something tvOS can supply honestly.
+        XCTAssertNil(body["mac_address"] ?? nil)
+
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer not-a-secret")
+        XCTAssertNil(requestBody(request).range(of: Data("not-a-secret".utf8)),
+                     "token must never appear in the body")
+        XCTAssertFalse(url.absoluteString.contains("not-a-secret"))
+    }
+
+    /// `GET /api/saves/{id}/content` is what records that this device now holds
+    /// the newest save in the slot (`optimistic` defaults to true server-side),
+    /// and it only does so when `device_id` is on the request. Without it the
+    /// slot's 409 branch fires on the very next upload, because the server has no
+    /// sync row for this device at all.
+    func testSaveContentRequestCarriesDeviceIDWhenRegistered() throws {
+        let request = makeClient().saveContentRequest(id: 5150, deviceID: "dev-uuid")
+        let url = try XCTUnwrap(request.url)
+        XCTAssertEqual(url.path, "/api/saves/5150/content")
+        XCTAssertEqual(queryDict(from: url)["device_id"], "dev-uuid")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer not-a-secret")
+        XCTAssertFalse(url.absoluteString.contains("not-a-secret"))
+    }
+
+    /// An unregistered device must send no `device_id` at all: RomM 403s a
+    /// `device_id` the token has no device scope for and 404s one it does not
+    /// know, so a placeholder would turn "conflict detection is degraded" into
+    /// "no save can be read or written".
+    func testSaveContentRequestOmitsDeviceIDWhenUnregistered() throws {
+        let url = try XCTUnwrap(makeClient().saveContentRequest(id: 5150, deviceID: nil).url)
+        XCTAssertNil(url.query)
+    }
+
+    func testCreateSaveOmitsDeviceIDWhenUnregistered() async throws {
+        let responseJSON = Data("""
+        {"id": 5152, "rom_id": 8343, "file_name": "RommpleTV Memory Card.mcr",
+         "file_size_bytes": 4, "missing_from_fs": false,
+         "created_at": "2026-03-03T09:00:00", "updated_at": "2026-03-03T09:00:00",
+         "emulator": "mednafen_psx", "slot": "0", "content_hash": null,
+         "origin_device_id": null}
+        """.utf8)
+        var captured: URLRequest?
+        StubProtocol.responder = { req in
+            captured = req
+            return (200, responseJSON)
+        }
+        _ = try await makeClient().createSave(
+            romID: 8343, emulator: "mednafen_psx", slot: "0", deviceID: nil,
+            data: Data([1, 2, 3, 4]), autocleanup: true)
+
+        let query = queryDict(from: try XCTUnwrap(try XCTUnwrap(captured).url))
+        XCTAssertNil(query["device_id"])
+        XCTAssertEqual(query["overwrite"], "false")
+        XCTAssertEqual(query["slot"], "0")
+    }
+
     func testLiveServerSmoke() async throws {
         let environment = ProcessInfo.processInfo.environment
         guard let baseURLString = environment["ROMM_BASE_URL"],

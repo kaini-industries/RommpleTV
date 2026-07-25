@@ -110,8 +110,76 @@ public final class RommClient: @unchecked Sendable {
         authorizedRequest(url("/api/firmware/\(id)/content", fileName: fileName))
     }
 
-    public func saveContentRequest(id: Int) -> URLRequest {
-        authorizedRequest(url("/api/saves/\(id)/content"))
+    /// Content request for one save.
+    ///
+    /// `deviceID` is not decoration. RomM's download route takes `optimistic`
+    /// (default true) and, **only when `device_id` is present**, records that this
+    /// device now holds that save. That sync row is the sole evidence the server
+    /// has of what a device is carrying, and the slot branch of `add_save`'s
+    /// conflict check treats a *missing* row as a conflict — so a client that
+    /// downloads without identifying itself gets HTTP 409 on its next upload to
+    /// the slot, every time, forever. Fetching with the device id is one request;
+    /// `POST /api/saves/{id}/downloaded` would be a second one doing the same job.
+    ///
+    /// `nil` omits the parameter entirely, which is required rather than tidy: an
+    /// unknown device id is a 404 and an id sent by a token without the device
+    /// scope is a 403, so a placeholder would break reading saves outright.
+    public func saveContentRequest(id: Int, deviceID: String? = nil) -> URLRequest {
+        let query = deviceID.map { ["device_id": $0] } ?? [:]
+        return authorizedRequest(url("/api/saves/\(id)/content", query: query))
+    }
+
+    // MARK: - Device identity
+
+    /// Devices RomM has registered for this user. Bare array response.
+    public func devices() async throws -> [RommDevice] {
+        try await get([RommDevice].self, path: "/api/devices", query: [:])
+    }
+
+    /// Registers this Apple TV, or returns the registration it already has.
+    ///
+    /// RomM dedups on a fingerprint: `(user, mac_address)` first, then
+    /// `(user, hostname, platform)`. Only the latter is usable here — tvOS will
+    /// not hand out a hardware address, and inventing one would take priority
+    /// over the honest fingerprint and split into a new device row whenever the
+    /// invented value changed. So `hostname` carries a stable per-install
+    /// identifier and `platform` is constant, and `allow_existing` (the payload
+    /// default, sent explicitly because it is load-bearing) makes a repeat
+    /// registration answer 200 with the same `device_id` instead of 409.
+    ///
+    /// Deliberately not sent: `mac_address` and `ip_address` (see above; the
+    /// latter is unreachable in RomM's fingerprint from this endpoint anyway),
+    /// `allow_duplicate` (it would force a new row per launch), `reset_syncs`
+    /// (it deletes every sync row this device has, which re-arms the slot-409 on
+    /// every save it holds), and `sync_mode`/`sync_config` (server defaults).
+    public func registerDevice(
+        name: String, platform: String, client: String,
+        clientVersion: String?, hostname: String
+    ) async throws -> RommDeviceRegistration {
+        var request = authorizedRequest(url("/api/devices"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(
+            DeviceRegistrationPayload(name: name, platform: platform, client: client,
+                                      clientVersion: clientVersion, hostname: hostname))
+        return try await send(RommDeviceRegistration.self, request: request)
+    }
+
+    /// Keys are spelled for RomM's `DeviceCreatePayload`. Encoded with no
+    /// key-encoding strategy so the spelling is visible here rather than derived.
+    private struct DeviceRegistrationPayload: Encodable {
+        let name: String
+        let platform: String
+        let client: String
+        let clientVersion: String?
+        let hostname: String
+        let allowExisting = true
+
+        enum CodingKeys: String, CodingKey {
+            case name, platform, client, hostname
+            case clientVersion = "client_version"
+            case allowExisting = "allow_existing"
+        }
     }
 
     /// Post a memory-card save.
@@ -124,12 +192,22 @@ public final class RommClient: @unchecked Sendable {
     /// sync; `send` surfaces that refusal as `RommError.http(409)`, which a
     /// coordinator can catch to detect the newer-save case and reconcile.
     ///
-    /// What RomM does with the row behind this request — append a version or
-    /// update an existing one for the same `(rom_id, file_name, slot)` — is the
-    /// server's business and is not asserted here; the caller must not assume
-    /// each POST yields a distinct record. Active cards pass `autocleanup: true`
-    /// so the server prunes to `autocleanupLimit` versions; conflict archives
-    /// pass `autocleanup: false` and their own timestamped slot.
+    /// What RomM does with the row behind this request is the server's business
+    /// and is still not asserted here; the caller must not assume each POST yields
+    /// a distinct record. (For the record, in RomM 5.0.0 a POST carrying a
+    /// non-empty `slot` stamps the stored filename with a fresh
+    /// `[YYYY-MM-DD_HH-MM-SS]` tag before the by-filename lookup, so slot uploads
+    /// insert a new row and `autocleanup` genuinely prunes the slot; only
+    /// slot-less uploads take the update-in-place branch. A caller that depends on
+    /// either behaviour will break on a server that changes it.) Active cards pass
+    /// `autocleanup: true` so the server prunes to `autocleanupLimit` versions;
+    /// conflict archives pass `autocleanup: false` and their own timestamped slot.
+    ///
+    /// `deviceID` is optional because an unregistered device must send none at
+    /// all: RomM 404s an id it does not know and 403s one the token has no device
+    /// scope for, either of which would fail the upload outright. Sending nothing
+    /// costs the server's conflict detection — both 409 branches require a
+    /// resolved device — and nothing else.
     ///
     /// `fileName` names the single `saveFile` part and defaults to the constant
     /// `RommClient.memoryCardFileName`; it is never derived from a game title.
@@ -138,20 +216,21 @@ public final class RommClient: @unchecked Sendable {
         romID: Int,
         emulator: String,
         slot: String,
-        deviceID: String,
+        deviceID: String?,
         data: Data,
         autocleanup: Bool,
         autocleanupLimit: Int = 10
     ) async throws -> RommSave {
-        var request = authorizedRequest(url("/api/saves", query: [
+        var query = [
             "rom_id": String(romID),
             "emulator": emulator,
             "slot": slot,
-            "device_id": deviceID,
             "overwrite": "false",
             "autocleanup": String(autocleanup),
             "autocleanup_limit": String(autocleanupLimit),
-        ]))
+        ]
+        if let deviceID { query["device_id"] = deviceID }
+        var request = authorizedRequest(url("/api/saves", query: query))
         let boundary = "RommpleTVBoundary-\(UUID().uuidString)"
         request.httpMethod = "POST"
         request.setValue("multipart/form-data; boundary=\(boundary)",

@@ -170,6 +170,71 @@ public struct RommSave: Identifiable, Decodable, Sendable {
              createdAt = "created_at", updatedAt = "updated_at", emulator, slot,
              contentHash = "content_hash", originDeviceID = "origin_device_id"
     }
+
+    /// Public so callers outside the module — a test double, a fake server — can
+    /// build a record without a JSON round trip.
+    public init(id: Int, romID: Int, fileName: String, fileSizeBytes: Int64,
+                missingFromFS: Bool = false, createdAt: String, updatedAt: String,
+                emulator: String? = nil, slot: String? = nil, contentHash: String? = nil,
+                originDeviceID: String? = nil) {
+        self.id = id
+        self.romID = romID
+        self.fileName = fileName
+        self.fileSizeBytes = fileSizeBytes
+        self.missingFromFS = missingFromFS
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.emulator = emulator
+        self.slot = slot
+        self.contentHash = contentHash
+        self.originDeviceID = originDeviceID
+    }
+}
+
+/// A device RomM has registered for the authenticated user.
+///
+/// `id` is the value every `device_id` query parameter refers to: a UUID string
+/// the *server* issues, resolved by `(id, user_id)`. It is **not**
+/// `client_device_identifier`, which only RomM's device-pairing flow
+/// (`/api/auth/device/*`) can write and which `POST /api/devices` has no field
+/// for — that is why registration fingerprints on `hostname` + `platform`
+/// instead. Every field but `id` is nullable because devices registered by other
+/// clients fill in whichever ones they please.
+public struct RommDevice: Identifiable, Decodable, Sendable {
+    public let id: String
+    public let name: String?
+    public let platform: String?
+    public let hostname: String?
+    public let clientDeviceIdentifier: String?
+
+    public init(id: String, name: String? = nil, platform: String? = nil,
+                hostname: String? = nil, clientDeviceIdentifier: String? = nil) {
+        self.id = id
+        self.name = name
+        self.platform = platform
+        self.hostname = hostname
+        self.clientDeviceIdentifier = clientDeviceIdentifier
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, platform, hostname
+        case clientDeviceIdentifier = "client_device_identifier"
+    }
+}
+
+/// What `POST /api/devices` answers with — three fields, not a whole device.
+/// The same shape comes back whether the device was created (201) or already
+/// existed (200), so a caller reads `deviceID` without caring which happened.
+public struct RommDeviceRegistration: Decodable, Sendable {
+    public let deviceID: String
+    public let name: String?
+
+    public init(deviceID: String, name: String? = nil) {
+        self.deviceID = deviceID
+        self.name = name
+    }
+
+    enum CodingKeys: String, CodingKey { case deviceID = "device_id", name }
 }
 
 /// Sort choices exposed to callers, mapped to RomM's `order_by`/`order_dir` query fields.
