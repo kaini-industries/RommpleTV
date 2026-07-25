@@ -37,5 +37,8 @@ public enum PlatformSupport {
         "virtualboy",
     ]
     public static func core(forSlug slug: String) -> CoreDescriptor? { map[slug.lowercased()] }
-    public static func isPlayable(slug: String) -> Bool { launchReadySlugs.contains(slug.lowercased()) }
+    public static func isPlayable(slug: String) -> Bool {
+        let key = slug.lowercased()
+        return map[key] != nil && launchReadySlugs.contains(key)
+    }
 }

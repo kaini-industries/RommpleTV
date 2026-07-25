@@ -28,11 +28,14 @@ final class PlatformSupportTests: XCTestCase {
     }
     func testCaseInsensitive() {
         XCTAssertNotNil(PlatformSupport.core(forSlug: "SNES"))
+        XCTAssertTrue(PlatformSupport.isPlayable(slug: "SNES"))
     }
     func testPlayStationUsesSoftwareBeetlePSX() {
         let core = PlatformSupport.core(forSlug: "psx")
         XCTAssertEqual(core?.coreName, "mednafen_psx_libretro_tvos")
         XCTAssertEqual(core?.displayName, "Beetle PSX")
         XCTAssertFalse(PlatformSupport.isPlayable(slug: "PSX"))
+        XCTAssertEqual(PlatformSupport.core(forSlug: "ps1")?.coreName, "mednafen_psx_libretro_tvos")
+        XCTAssertFalse(PlatformSupport.isPlayable(slug: "ps1"))
     }
 }
