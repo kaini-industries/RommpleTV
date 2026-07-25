@@ -35,6 +35,13 @@ final class ControllerInput {
     private func mapAll() {
         for controller in GCController.controllers() {
             guard let pad = controller.extendedGamepad else { continue }
+            // The default, pinned rather than assumed. Every handler below ends
+            // in `EmulatorEngine`, and the overlay one reaches `pause()`, which
+            // flushes the save through `MainActor.assumeIsolated` — that traps
+            // rather than misbehaving quietly if it is ever called from anywhere
+            // but the main thread, so which queue GameController delivers on is
+            // load-bearing and is stated here.
+            controller.handlerQueue = .main
             let send = { [weak self] (b: RetroButton, pressed: Bool) in
                 self?.handler?(b, pressed)
             }

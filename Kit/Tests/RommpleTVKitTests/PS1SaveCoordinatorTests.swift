@@ -1061,6 +1061,7 @@ final class PS1SaveCoordinatorTests: XCTestCase {
             (URLError(.notConnectedToInternet), .serverUnreachable),
             (RommError.http(401), .tokenRejected),
             (RommError.http(403), .tokenRejected),
+            (RommError.http(409), .anotherDeviceWrote),
             (RommError.http(500), .serverError(status: 500)),
             (RommError.badResponse, .unreadableAnswer),
             (DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "x")),
@@ -1125,6 +1126,42 @@ final class PS1SaveCoordinatorTests: XCTestCase {
                            PS1SaveSyncError.archiveFailed(.other).errorDescription)
             XCTAssertEqual(PS1SaveSyncError.conflictNotResolved(cause).errorDescription,
                            PS1SaveSyncError.conflictNotResolved(.other).errorDescription)
+        }
+    }
+
+    /// The advice is only ever read on the chooser, where the one action a
+    /// player has is to choose again — so every cause has to end by saying so.
+    ///
+    /// Asserted over `allCases` rather than over the handful the resolution
+    /// tests happen to produce: a cause that explains itself and then stops
+    /// leaves a player reading an explanation on a screen that is waiting for a
+    /// decision, which is the same defect as advice that contradicts its cause.
+    /// `allCases` is hand-written — `serverError` carries a status, so nothing is
+    /// synthesized for it — and a hand-written list can quietly lose a case,
+    /// which would exempt that case from every assertion below. This is the line
+    /// that turns that into a failure.
+    ///
+    /// Adding a cause: give it advice (the compiler insists on that much), add it
+    /// to `allCases`, and bump the number here.
+    func testAllCasesReallyIsEveryCause() {
+        XCTAssertEqual(PS1SaveSyncCause.allCases.count, 8,
+                       "a cause was added or removed without `allCases` following it")
+        XCTAssertEqual(Set(PS1SaveSyncCause.allCases.map(\.recoverySuggestion)).count, 8,
+                       "two causes give the same advice, so at least one of them is wrong "
+                           + "about what happened")
+    }
+
+    func testEveryCauseSaysWhatToDoNext() {
+        XCTAssertFalse(PS1SaveSyncCause.allCases.isEmpty)
+        for cause in PS1SaveSyncCause.allCases {
+            let advice = cause.recoverySuggestion
+            XCTAssertTrue(advice.lowercased().contains("choose again"),
+                          "\(cause) leaves the player with nothing to do: \"\(advice)\"")
+            // And it reaches the player through both stages, unchanged.
+            for error in [PS1SaveSyncError.archiveFailed(cause),
+                          PS1SaveSyncError.conflictNotResolved(cause)] {
+                XCTAssertEqual(error.recoverySuggestion, advice, "\(error)")
+            }
         }
     }
 

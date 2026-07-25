@@ -54,6 +54,11 @@ struct EmulatorHostView: View {
                 // EmulatorEngine.onOverlayRequested (wired in
                 // MetalHostRepresentable) — see ControllerInput.swift.
                 .onPlayPauseCommand(perform: toggleOverlay)
+                // Every way an overlay opens goes through this, which is why the
+                // note is taken here rather than at each of the three call sites.
+                .onChange(of: showOverlay) { _, isShowing in
+                    if isShowing { deliverUnwrittenCardNote() }
+                }
                 .onChange(of: scenePhase) { _, phase in
                     guard phase != .active else { return }
                     // Leaving the app is a moment the card has to be on disk. The
@@ -123,6 +128,25 @@ struct EmulatorHostView: View {
             // that flush, so the reason is on screen; there is nothing to add and
             // nothing to dismiss.
         }
+    }
+
+    /// Says what a previous session could not: that its last write did not land.
+    ///
+    /// There is one way out of a game that never reaches the overlay — backing
+    /// out with the Siri remote's Menu button, which dismisses this view and
+    /// only then lets `EmulatorEngine.stop()` take its final flush. A failure
+    /// there has no screen to appear on, so it is written down
+    /// (`UnwrittenCardNote`) and delivered here, the first time an overlay opens
+    /// in a later session, exactly once.
+    ///
+    /// A failure this session already has outranks it and leaves the note
+    /// standing: the live one is the one the player can still act on, and the
+    /// note will keep until an overlay opens without one.
+    private func deliverUnwrittenCardNote() {
+        guard saveFailure == nil,
+              UnwrittenCardNote.exists(romID: launch.canonicalRomID) else { return }
+        UnwrittenCardNote.clear(romID: launch.canonicalRomID)
+        saveFailure = .lastSessionUnwritten
     }
 
     /// Controller-disconnect safety: the engine has already paused and

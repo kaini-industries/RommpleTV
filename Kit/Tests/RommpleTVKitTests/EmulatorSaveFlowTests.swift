@@ -231,6 +231,47 @@ final class EmulatorSaveFlowTests: XCTestCase {
         XCTAssertNil(flow.failure)
     }
 
+    // MARK: The note a session leaves behind
+
+    /// Backing out with Menu dismisses the view before the engine's last flush
+    /// runs, so a failure there has nowhere to be shown. The note is what makes
+    /// the next session able to say so.
+    func testTheNoteIsPerGameAndSurvivesUntilAWriteLands() throws {
+        let suite = "UnwrittenCardNoteTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        XCTAssertFalse(UnwrittenCardNote.exists(romID: 7, defaults: defaults))
+
+        UnwrittenCardNote.record(romID: 7, defaults: defaults)
+        XCTAssertTrue(UnwrittenCardNote.exists(romID: 7, defaults: defaults))
+        XCTAssertFalse(UnwrittenCardNote.exists(romID: 8, defaults: defaults),
+                       "one game's failed write was reported against another game")
+
+        // Reading it does not consume it: the player may not pause this session
+        // either, and the card is still unwritten until something writes it.
+        XCTAssertTrue(UnwrittenCardNote.exists(romID: 7, defaults: defaults))
+
+        UnwrittenCardNote.clear(romID: 7, defaults: defaults)
+        XCTAssertFalse(UnwrittenCardNote.exists(romID: 7, defaults: defaults))
+        // Idempotent, because it is called after every successful flush.
+        UnwrittenCardNote.clear(romID: 7, defaults: defaults)
+        XCTAssertFalse(UnwrittenCardNote.exists(romID: 7, defaults: defaults))
+    }
+
+    /// The two messages are not interchangeable: one is about progress the player
+    /// still has, the other about a session that is over.
+    func testTheTwoSaveMessagesSayDifferentThings() {
+        XCTAssertNotEqual(EmulatorSaveFailure.localWriteFailed,
+                          EmulatorSaveFailure.lastSessionUnwritten)
+        XCTAssertTrue(EmulatorSaveFailure.lastSessionUnwritten.message.contains("last time"),
+                      EmulatorSaveFailure.lastSessionUnwritten.message)
+        for failure in [EmulatorSaveFailure.localWriteFailed, .lastSessionUnwritten] {
+            XCTAssertTrue(failure.recovery.contains("Retry Save"), failure.recovery)
+            XCTAssertFalse(failure.message.contains("/"), failure.message)
+        }
+    }
+
     // MARK: The trigger table
 
     /// Every trigger except the tick asks for an immediate sync, and the tick

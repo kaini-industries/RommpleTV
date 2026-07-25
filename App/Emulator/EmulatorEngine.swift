@@ -104,7 +104,8 @@ final class EmulatorEngine: NSObject, CoreAVSink {
             // A read failure is propagated rather than swallowed: treating an
             // unreadable save as a missing one starts the game on a blank
             // battery and the next flush writes that blank over the real one.
-            // Task 11 turns this into a message a player can act on.
+            // It reaches the player as the "Can't start emulation" screen, which
+            // offers a way back to the library and leaves the card untouched.
             restored = try launch.saveStore.load(romID: launch.canonicalRomID)
         } catch {
             // A constructed core owns the process-wide gCore slot; failing to
@@ -165,7 +166,14 @@ final class EmulatorEngine: NSObject, CoreAVSink {
         // Must flush while the core is still loaded — saveRAM() needs it. The
         // Quit button has already blocked on its own flush by the time this
         // runs; this is the last chance for every other way a game ends.
-        _ = runFlush(.quit)
+        //
+        // And it is the one flush with nowhere to publish a failure: the view
+        // that shows it is already being torn down, which is exactly what the
+        // Siri remote's Menu button does. So a failure here is written down
+        // instead, and the next session says so. See `UnwrittenCardNote`.
+        if case .failed = runFlush(.quit), let launch {
+            UnwrittenCardNote.record(romID: launch.canonicalRomID)
+        }
         core?.unload(); core = nil
     }
 

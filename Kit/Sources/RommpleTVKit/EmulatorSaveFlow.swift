@@ -59,6 +59,55 @@ public struct EmulatorSaveFailure: Error, LocalizedError, Equatable, Sendable {
         message: "RommpleTV could not save this game on this Apple TV.",
         recovery: "Your progress is still in the game. Choose Retry Save to write it again — "
             + "quitting now would lose it.")
+
+    /// What a previous session's `UnwrittenCardNote` becomes on screen. A
+    /// different sentence because it is about a different session: the progress
+    /// it names is already gone, and what the player can still do something
+    /// about is this one.
+    public static let lastSessionUnwritten = EmulatorSaveFailure(
+        message: "The last time you played this game, RommpleTV could not save it on this "
+            + "Apple TV.",
+        recovery: "Choose Retry Save to write this game's save now. If it fails again, restart "
+            + "RommpleTV before playing on.")
+}
+
+/// The note a session leaves behind when its last write did not land and there
+/// was nobody left to tell.
+///
+/// The pause overlay is where a failed write is shown, and there is one way out
+/// of a game that never reaches it: backing out with Menu, which dismisses the
+/// view first and only then lets `EmulatorEngine.stop()` take its final flush.
+/// A failure there has no surface at all — the view it would have been published
+/// to is already gone — so it is written down instead, and the next session
+/// says so.
+///
+/// A flag and nothing else. No card bytes: whatever did reach the local store is
+/// still the local store's, and on a PlayStation launch the coordinator's own
+/// pending flag is what gets it to the server.
+///
+/// **It is retired by being shown, not by time or by a later success.** A note
+/// cleared by this session's first successful write would usually be cleared ten
+/// seconds in, before the player had any reason to open the overlay — which is a
+/// message that exists but is not delivered. So the host takes it the first time
+/// an overlay opens, and it is shown exactly once. If the same failure is still
+/// happening, the periodic path says so on its own and much louder.
+public enum UnwrittenCardNote {
+    static func key(_ romID: Int) -> String { "save.unwritten.\(romID)" }
+
+    public static func record(romID: Int, defaults: UserDefaults = .standard) {
+        defaults.set(true, forKey: key(romID))
+    }
+
+    /// Taken when it has been shown. The read first is not an optimization: it
+    /// keeps this from writing to defaults for games that never left one.
+    public static func clear(romID: Int, defaults: UserDefaults = .standard) {
+        guard defaults.bool(forKey: key(romID)) else { return }
+        defaults.removeObject(forKey: key(romID))
+    }
+
+    public static func exists(romID: Int, defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: key(romID))
+    }
 }
 
 /// What one flush concluded, in the terms its caller has to act on.

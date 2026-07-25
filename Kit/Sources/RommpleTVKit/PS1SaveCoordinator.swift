@@ -56,6 +56,9 @@ public enum PS1SaveSyncCause: Equatable, Sendable {
     case serverUnreachable
     /// The server refused this app's access token (401/403).
     case tokenRejected
+    /// Another device wrote this game's card while the chooser was on screen —
+    /// RomM's 409. Not a server problem, and not something logs will explain.
+    case anotherDeviceWrote
     /// The server answered with a status that is not a refusal of the token.
     case serverError(status: Int)
     /// The server answered with something this app could not read: a non-HTTP
@@ -70,9 +73,15 @@ public enum PS1SaveSyncCause: Equatable, Sendable {
     /// Anything else. No advice beyond trying again is honest for this.
     case other
 
-    /// What to do about it. Every sentence ends in "choose again", because every
-    /// one of these leaves a conflict that is still resolvable with the same
-    /// token.
+    /// What to do about it.
+    ///
+    /// **Every one of these names choosing again as the next action** — a rule
+    /// rather than a habit, because the only screen they are ever shown on is
+    /// the chooser, and a player standing in front of two memory cards has
+    /// exactly one action available. A branch that explains the cause and stops
+    /// is the same defect this type exists to remove, one notch softer.
+    /// `PS1SaveCoordinatorTests.testEveryCauseSaysWhatToDoNext` asserts it over
+    /// `allCases`.
     var recoverySuggestion: String {
         switch self {
         case .serverUnreachable:
@@ -80,12 +89,14 @@ public enum PS1SaveSyncCause: Equatable, Sendable {
         case .tokenRejected:
             return "Create a fresh token on your RomM server and enter it in Server Settings, "
                 + "then choose again."
+        case .anotherDeviceWrote:
+            return "Another device saved this game while you were choosing. Choose again."
         case let .serverError(status):
             return "Your RomM server answered with status \(status). Choose again; if it keeps "
                 + "happening, check your server's logs."
         case .unreadableAnswer:
             return "Your RomM server sent an answer RommpleTV could not read, which usually "
-                + "means it is a version RommpleTV does not understand yet."
+                + "means it is a version RommpleTV does not understand yet. Choose again."
         case .localWriteFailed:
             return "Restart RommpleTV, then choose again."
         case .serverKeptAnOlderVersion:
@@ -94,6 +105,20 @@ public enum PS1SaveSyncCause: Equatable, Sendable {
         case .other:
             return "Choose again."
         }
+    }
+}
+
+extension PS1SaveSyncCause: CaseIterable {
+    /// Written out rather than synthesized, because `serverError` carries a
+    /// status.
+    ///
+    /// A new cause cannot be added without landing in this file — the switch in
+    /// `recoverySuggestion` above stops compiling until it is given advice — and
+    /// this is the list that advice is then checked against, so the case belongs
+    /// here too.
+    public static var allCases: [PS1SaveSyncCause] {
+        [.serverUnreachable, .tokenRejected, .anotherDeviceWrote, .serverError(status: 500),
+         .unreadableAnswer, .localWriteFailed, .serverKeptAnOlderVersion, .other]
     }
 }
 
@@ -681,8 +706,9 @@ public actor PS1SaveCoordinator {
     /// does not match — after which the next reconciliation reads "local changed,
     /// remote did not" and uploads the *older* card over the newer remote one.
     /// So the call belongs **inside** the `do` block, after `try save` has
-    /// returned, and never on a tick where the write threw. Task 11 wires
-    /// `EmulatorEngine.flushSRAMIfNeeded`; nothing in `App/` calls this yet.
+    /// returned, and never on a tick where the write threw. The one caller is
+    /// `EmulatorSaveFlow`, which reaches it from the statement after a local
+    /// write that returned — and cannot reach it from one that threw.
     ///
     /// The bytes are kept in memory, never in UserDefaults. The *flag* is
     /// persisted, so a cold start after a crash knows there is an upload owed and
@@ -957,8 +983,15 @@ public actor PS1SaveCoordinator {
             case .badResponse:
                 return .unreadableAnswer
             case let .http(status):
-                return status == 401 || status == 403 ? .tokenRejected
-                                                      : .serverError(status: status)
+                switch status {
+                case 401, 403: return .tokenRejected
+                // The same status `performFlush` and `upload` both treat as a
+                // conflict rather than a failure. Rare here — stage 1 uploads to
+                // a slot no other writer uses — but "check your server's logs"
+                // is the wrong sentence for another Apple TV having saved.
+                case 409: return .anotherDeviceWrote
+                default: return .serverError(status: status)
+                }
             }
         }
         if error is DecodingError { return .unreadableAnswer }
