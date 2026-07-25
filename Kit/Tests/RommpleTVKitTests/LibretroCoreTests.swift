@@ -1080,6 +1080,38 @@ final class LibretroCoreTests: XCTestCase {
         XCTAssertThrowsError(try controller.switchDisc(to: 0))
     }
 
+    /// "Has a Disk Control interface" and "reports more than one disc" are two
+    /// different questions, and the disc UI asks both: a core with no interface
+    /// at all is a two-disc game that cannot reach disc 2 and should say so,
+    /// while an interface answering a count the package disagrees with is a
+    /// mapping that must not be indexed. A count of zero cannot tell them apart,
+    /// so registration is readable on its own.
+    func testRegistrationIsReadableApartFromTheDiscCount() throws {
+        var controller = DiskController()
+        XCTAssertFalse(controller.hasDiskControl)
+        XCTAssertEqual(controller.discCount, 0)
+
+        var ext = ExtendedSpyCallbacks.callback
+        withUnsafeMutableBytes(of: &ext) {
+            _ = controller.handleEnvironment(
+                RETRO_ENVIRONMENT_SET_DISK_CONTROL_EXT_INTERFACE, $0.baseAddress)
+        }
+        extendedSpy.reset(imageCount: 0)
+        XCTAssertTrue(controller.hasDiskControl,
+                      "an interface reporting no discs read as no interface at all")
+        XCTAssertEqual(controller.discCount, 0)
+
+        XCTAssertEqual(
+            controller.handleEnvironment(
+                RETRO_ENVIRONMENT_SET_DISK_CONTROL_EXT_INTERFACE, nil), true)
+        XCTAssertFalse(controller.hasDiskControl, "a deregistered interface still read as present")
+
+        // And it goes away with the core's image, like the callbacks it answers
+        // for: past `unload()` these address unmapped code.
+        controller.clear()
+        XCTAssertFalse(controller.hasDiskControl)
+    }
+
     // MARK: - Disc switching
 
     private func registeredController(imageCount: UInt32 = 3,

@@ -22,6 +22,16 @@ struct EmulatorHostView: View {
     /// screen when a write fails, and the player has to be able to keep playing,
     /// retry, or quit knowing what they are giving up.
     @State private var saveFailure: EmulatorSaveFailure?
+    /// Which discs this session may switch between, published by the engine once
+    /// the game is loaded. `nil` until then, and — by construction — a state that
+    /// shows nothing at all for a legacy or single-disc launch.
+    @State private var discFlow: DiscSwitchFlow?
+    /// Whether the disc picker is on top of the pause overlay. Only ever true
+    /// while `showOverlay` is, so the game is stopped for the whole of it.
+    @State private var showDiscPicker = false
+    /// Where the memory card's server half stands, or `.idle` on a legacy
+    /// launch, which has no server-side save at all.
+    @State private var syncStatus: PS1SaveSyncStatus = .idle
 
     var body: some View {
         Group {
@@ -32,22 +42,51 @@ struct EmulatorHostView: View {
                     MetalHostRepresentable(launch: launch,
                                            startFailure: $startFailure,
                                            showOverlay: showOverlay,
-                                           onEngineReady: { engine = $0 },
+                                           onEngineReady: {
+                                               engine = $0
+                                               discFlow = $0.discFlow
+                                           },
                                            onOverlayRequested: toggleOverlay,
                                            onPauseRequested: forceShowOverlay,
                                            onLocalSaveFailure: { saveFailure = $0 })
                         .ignoresSafeArea()
                     if showOverlay {
-                        PauseOverlayView(
-                            saveFailure: saveFailure,
-                            onResume: resumeAndHideOverlay,
-                            onRestart: {
-                                engine?.restartGame()
-                                resumeAndHideOverlay()
-                            },
-                            onRetrySave: { try? engine?.flushSaveNow(reason: .user) },
-                            onQuit: quitIfSaved)
+                        if showDiscPicker, let discFlow {
+                            // Siri remote Menu and the Xbox pad's B both arrive
+                            // as the exit command, and it is handled here rather
+                            // than on the host: with the picker closed there is
+                            // no handler, so Menu keeps backing out of the game
+                            // exactly as it did before.
+                            DiscPickerView(flow: discFlow, onDone: { showDiscPicker = false })
+                                .onExitCommand { showDiscPicker = false }
+                        } else {
+                            PauseOverlayView(
+                                saveFailure: saveFailure,
+                                discs: discFlow,
+                                syncStatus: syncStatus,
+                                onResume: resumeAndHideOverlay,
+                                onRestart: {
+                                    engine?.restartGame()
+                                    resumeAndHideOverlay()
+                                },
+                                onChangeDisc: {
+                                    discFlow?.refresh()
+                                    showDiscPicker = true
+                                },
+                                onRetrySave: { try? engine?.flushSaveNow(reason: .user) },
+                                onRetrySync: { launch.retrySaveSync(.user) },
+                                onQuit: quitIfSaved)
+                        }
                     }
+                }
+                // The coordinator's sanitized status stream, consumed for as long
+                // as the game is on screen. `AsyncStream` buffers what nobody has
+                // read yet, so a status published while preparation was still
+                // running is still delivered here. A legacy launch has no stream
+                // and this does nothing.
+                .task {
+                    guard let statuses = launch.saveStatuses else { return }
+                    for await status in statuses { syncStatus = status }
                 }
                 // Siri remote's play/pause button opens/closes the overlay.
                 // The Xbox pad's left-stick click reaches the same toggle via
@@ -64,7 +103,9 @@ struct EmulatorHostView: View {
                     // Leaving the app is a moment the card has to be on disk. The
                     // game stops where it is and the overlay comes up, so a
                     // failure that happened while nobody was looking is the first
-                    // thing on screen when the player comes back.
+                    // thing on screen when the player comes back — which means
+                    // the picker, if it was open, is not on top of it.
+                    showDiscPicker = false
                     engine?.handleBackground()
                     showOverlay = true
                 }
@@ -108,6 +149,10 @@ struct EmulatorHostView: View {
     }
 
     private func resumeAndHideOverlay() {
+        // The picker may not outlive the pause it was opened under: it is the one
+        // piece of this UI that can ask the core to do something, and the core may
+        // only be asked while frames are stopped.
+        showDiscPicker = false
         engine?.resume()
         showOverlay = false
     }
@@ -154,8 +199,9 @@ struct EmulatorHostView: View {
     /// is actually on screen. Unlike `toggleOverlay`, this never hides it.
     /// The periodic save failure comes through here too, for the same reason:
     /// the game has already been stopped and the overlay is where the message
-    /// and Retry Save live.
+    /// and Retry Save live — so the picker, which would be on top of it, closes.
     private func forceShowOverlay() {
+        showDiscPicker = false
         showOverlay = true
     }
 }
@@ -248,16 +294,29 @@ private struct MetalHostRepresentable: UIViewControllerRepresentable {
 struct PauseOverlayView: View {
     /// Non-nil when the last flush did not reach the local card.
     let saveFailure: EmulatorSaveFailure?
+    /// This session's discs, or `nil` when there is no disc state at all — which
+    /// is every launch until the game has loaded. A flow whose availability is
+    /// `.single` shows nothing either, which is every legacy and one-disc game.
+    var discs: DiscSwitchFlow?
+    /// Where the memory card's server half stands. `.idle` shows nothing, and is
+    /// what a legacy launch always has.
+    var syncStatus: PS1SaveSyncStatus = .idle
     let onResume: () -> Void
     let onRestart: () -> Void
+    /// Opens the disc picker. Only reachable when `discs` offers switching.
+    var onChangeDisc: () -> Void = {}
     /// Runs a `.user` flush. The message clears only if it lands, which is
     /// `EmulatorSaveFlow`'s rule and not this view's.
     let onRetrySave: () -> Void
+    /// Asks the uploader to send what is owed now, under `.user`. Fire and
+    /// forget: it hands work to an actor and returns, so gameplay is never
+    /// waiting on a server.
+    var onRetrySync: () -> Void = {}
     /// Called for a Quit. The caller flushes first and dismisses only on success,
     /// so pressing this with a failing card leaves the player exactly here.
     let onQuit: () -> Void
 
-    private enum Focusable: Hashable { case resume, restart, retrySave, quit }
+    private enum Focusable: Hashable { case resume, changeDisc, restart, retrySave, retrySync, quit }
     @FocusState private var focused: Focusable?
 
     var body: some View {
@@ -277,9 +336,28 @@ struct PauseOverlayView: View {
                     }
                     .frame(maxWidth: 900)
                 }
+                if let discs, discs.showsDiscSection {
+                    DiscStatusView(flow: discs)
+                }
+                if let message = syncStatus.overlayMessage {
+                    Text(message)
+                        .font(.caption).foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 900)
+                        .accessibilityIdentifier("pause.syncStatus")
+                }
                 Button("Resume", action: onResume)
                     .focused($focused, equals: .resume)
                     .accessibilityIdentifier("pause.resume")
+                // Offered only when the labels, the interface and the counts all
+                // agree — see `DiscSwitchAvailability.resolve`. `select` refuses
+                // on the same state, so hiding the button is not what makes a
+                // disabled session safe.
+                if let discs, discs.canSwitch {
+                    Button("Change Disc", action: onChangeDisc)
+                        .focused($focused, equals: .changeDisc)
+                        .accessibilityIdentifier("pause.changeDisc")
+                }
                 Button("Restart Game", action: onRestart)
                     .focused($focused, equals: .restart)
                     .accessibilityIdentifier("pause.restart")
@@ -288,6 +366,11 @@ struct PauseOverlayView: View {
                         .focused($focused, equals: .retrySave)
                         .accessibilityIdentifier("pause.retrySave")
                 }
+                if syncStatus.offersSyncRetry {
+                    Button("Retry Sync", action: onRetrySync)
+                        .focused($focused, equals: .retrySync)
+                        .accessibilityIdentifier("pause.retrySync")
+                }
                 Button("Quit to Library", action: onQuit)
                     .focused($focused, equals: .quit)
                     .accessibilityIdentifier("pause.quit")
@@ -295,7 +378,105 @@ struct PauseOverlayView: View {
             .frame(maxWidth: 900)
         }
         // A failure opens on Retry Save: it is the remedy, and Quit — one press
-        // away — is the thing that would lose the save.
+        // away — is the thing that would lose the save. Deliberately unchanged by
+        // the disc and sync additions: neither of them is a remedy for a card
+        // that could not be written, and neither outranks one.
         .onAppear { focused = saveFailure == nil ? .resume : .retrySave }
+    }
+}
+
+/// What the pause overlay says about discs: which one is in the drive when that
+/// can be said honestly, and why switching is off when it is.
+///
+/// `@ObservedObject` rather than a snapshot: the flow re-reads the drive after
+/// every attempt, and this line has to follow it rather than the index the
+/// player asked for.
+private struct DiscStatusView: View {
+    @ObservedObject var flow: DiscSwitchFlow
+
+    var body: some View {
+        VStack(spacing: 8) {
+            if flow.canSwitch {
+                Text("Current disc: \(flow.currentDiscDescription)")
+                    .font(.callout)
+                    .accessibilityIdentifier("pause.currentDisc")
+            }
+            if let note = flow.note {
+                Text(note)
+                    .font(.caption).foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .accessibilityIdentifier("pause.discNote")
+            }
+        }
+        .frame(maxWidth: 900)
+    }
+}
+
+/// The disc picker: the disc in the drive, every disc this game has, and a way
+/// back.
+///
+/// It is only ever presented over a paused game, and every path out of it —
+/// choosing a disc that lands, Cancel, Menu, the pad's B — returns to the pause
+/// overlay rather than to the game, so nothing here can resume play behind a
+/// choice that has not been made.
+///
+/// A failed switch keeps this on screen with the message under the list and the
+/// drive's *actual* disc at the top, because trying the same disc again is the
+/// first thing worth doing and the second is knowing what is in there now.
+struct DiscPickerView: View {
+    @ObservedObject var flow: DiscSwitchFlow
+    let onDone: () -> Void
+
+    private enum Focusable: Hashable { case disc(Int), cancel }
+    @FocusState private var focused: Focusable?
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.9).ignoresSafeArea()
+            VStack(spacing: 20) {
+                Text("Change Disc").font(.title2)
+                Text("Current disc: \(flow.currentDiscDescription)")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .accessibilityIdentifier("disc.current")
+                if let failure = flow.failure {
+                    Text(failure)
+                        .font(.callout).multilineTextAlignment(.center)
+                        .frame(maxWidth: 900)
+                        .accessibilityIdentifier("disc.failure")
+                }
+                ForEach(Array(flow.availability.labels.enumerated()), id: \.offset) { index, label in
+                    Button(action: { choose(index) }) {
+                        Text(flow.isCurrent(index) ? "\(label) (in the drive)" : label)
+                    }
+                    .focused($focused, equals: .disc(index))
+                    .accessibilityIdentifier("disc.option.\(index)")
+                }
+                Button("Cancel", action: onDone)
+                    .focused($focused, equals: .cancel)
+                    .accessibilityIdentifier("disc.cancel")
+            }
+            .frame(maxWidth: 900)
+        }
+        // Opens on the disc in the drive when there is one to open on, and on
+        // Cancel when the drive cannot say — a picker that opened on a row that
+        // does not exist would open on nothing at all.
+        .onAppear {
+            let discs = flow.availability.labels.indices
+            focused = flow.currentIndex.flatMap { discs.contains($0) ? Focusable.disc($0) : nil }
+                ?? .cancel
+        }
+    }
+
+    /// The picker closes only when the drive did what was asked. A failure keeps
+    /// it open with `flow.failure` under the list — and with the index re-read,
+    /// so "Current disc" above is the drive's answer rather than this view's
+    /// hope.
+    private func choose(_ index: Int) {
+        switch flow.select(index) {
+        case .switched, .alreadyInserted:
+            onDone()
+        case .failed:
+            break
+        }
     }
 }

@@ -35,6 +35,16 @@ final class EmulatorEngine: NSObject, CoreAVSink {
     /// of invariant that has to be provable.
     private var saveFlow: EmulatorSaveFlow?
 
+    /// Which discs this session may switch between and which one is in the
+    /// drive, or `nil` before a game is loaded.
+    ///
+    /// Built once, in `start`, immediately after `loadGame` — the first moment
+    /// the core's Disk Control registration and disc count are both real — and
+    /// handed to the pause overlay. The engine keeps no disc state of its own:
+    /// the flow re-reads the core after every attempt, which is the only way the
+    /// index on screen is the index in the drive.
+    private(set) var discFlow: DiscSwitchFlow?
+
     /// Fired when the controller layer wants the pause overlay toggled
     /// (Xbox pad's left-stick click). The Siri remote's play/pause command
     /// is wired directly from SwiftUI instead, since it isn't a
@@ -137,6 +147,22 @@ final class EmulatorEngine: NSObject, CoreAVSink {
                     if let bytes = request.bytes { launch.onLocalSave(bytes) }
                     if let reason = request.retry { launch.retrySaveSync(reason) }
                 })
+            // Settled here rather than when the overlay opens: `discCount` and
+            // the Disk Control registration are answers about the *loaded game*,
+            // and `loadGame` above is what produced them. Every seam goes through
+            // `self` so that a core unloaded from under an open picker answers
+            // "no game" instead of calling into an unmapped image.
+            self.discFlow = DiscSwitchFlow(
+                labels: launch.discLabels,
+                seams: DiscSwitchSeams(
+                    hasDiskControl: { [weak self] in self?.core?.hasDiskControl ?? false },
+                    discCount: { [weak self] in self?.core?.discCount ?? 0 },
+                    currentIndex: { [weak self] in self?.core?.currentDiscIndex },
+                    isPaused: { [weak self] in self?.isPaused ?? false },
+                    switchDisc: { [weak self] index in
+                        guard let self else { throw DiscSwitchRefusal.noGameRunning }
+                        try self.switchDisc(to: index)
+                    }))
         }
 
         if let av = core.avInfo {
@@ -249,6 +275,37 @@ final class EmulatorEngine: NSObject, CoreAVSink {
     /// pause state untouched — callers resume separately.
     func restartGame() {
         core?.resetGame()
+    }
+
+    /// Puts another disc in the drive.
+    ///
+    /// Two requirements, and they are the same requirement wearing two hats.
+    /// `LibretroCore` is single-owner and every entry point on it is main-thread
+    /// only, and `runFrame()` is driven by a display link registered on `.main`
+    /// — so a switch that ran while frames were still arriving would eject a
+    /// disc from under `retro_run`. That is undefined behaviour in C, not a
+    /// dropped frame.
+    ///
+    /// `assumeIsolated` rather than a hop, for the same reason `runFlush` uses
+    /// it: every caller is already on the main thread (this arrives from
+    /// SwiftUI), and a hop would return before the switch had happened, leaving
+    /// the picker to re-read a drive nothing had touched yet.
+    ///
+    /// Refused rather than made to wait when frames are still running.
+    /// `DiscSwitchFlow` refuses this too, and this is not redundant with it: the
+    /// flow's guard is what a player's press meets and what the tests pin, while
+    /// this one is the promise the object holding the display link makes to the
+    /// core, and it holds for any caller — including one added later that does
+    /// not go through the flow.
+    ///
+    /// Throws without leaving the drive empty: the transaction and its
+    /// best-effort restore both live in `LibretroCore.switchDisc`.
+    func switchDisc(to index: Int) throws {
+        try MainActor.assumeIsolated {
+            guard let core else { throw DiscSwitchRefusal.noGameRunning }
+            guard isPaused else { throw DiscSwitchRefusal.framesRunning }
+            try core.switchDisc(to: index)
+        }
     }
 
     /// A dead battery or an out-of-range pad shouldn't leave the game

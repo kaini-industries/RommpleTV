@@ -33,8 +33,50 @@ public enum PS1ConflictChoice: Sendable, Equatable { case local, remote }
 
 /// The only things this coordinator will ever say out loud. No status carries a
 /// status code, a URL, a host name or a server message.
-public enum PS1SaveSyncStatus: Sendable, Equatable {
+public enum PS1SaveSyncStatus: Sendable, Equatable, CaseIterable {
     case idle, pending, syncing, conflict, failed, synced
+}
+
+extension PS1SaveSyncStatus {
+    /// What the pause overlay says about the server half of this game's save, or
+    /// `nil` when there is nothing worth saying.
+    ///
+    /// Constants, like every other sentence this app shows about synchronization:
+    /// the statuses themselves are already sanitized, and rendering anything the
+    /// server said would put a host name on screen. `CaseIterable` above is what
+    /// makes "every status has something to say" assertable rather than a claim
+    /// about the switch below.
+    ///
+    /// **None of these blocks gameplay.** The overlay they appear on keeps Resume
+    /// and Quit unconditionally, and the only one with an action attached
+    /// (``failed``) offers a retry that hands work to an actor and returns.
+    public var overlayMessage: String? {
+        switch self {
+        case .idle:
+            // Nothing has been asked of the server this session, or nothing is
+            // owed. Saying "up to date" would be a claim this has not checked.
+            return nil
+        case .pending:
+            return "This game's memory card hasn't reached your RomM server yet."
+        case .syncing:
+            return "Sending this game's memory card to your RomM server…"
+        case .conflict:
+            return "This game's memory card and the one on your RomM server disagree. "
+                + "Nothing has been changed on either side — RommpleTV will ask you which one "
+                + "to keep the next time this game launches."
+        case .failed:
+            return "RommpleTV couldn't send this game's memory card to your RomM server. "
+                + "It is saved on this Apple TV, and you can keep playing."
+        case .synced:
+            return "This game's memory card is up to date on your RomM server."
+        }
+    }
+
+    /// Whether the overlay offers an explicit "try again". Only a failure does:
+    /// a retry during ``syncing`` would ask for a second upload of the one in
+    /// flight, and on a ``conflict`` it would choose a side on the player's
+    /// behalf — which is the one thing this whole path refuses to do.
+    public var offersSyncRetry: Bool { self == .failed }
 }
 
 /// Why a retry is happening. Every one of these bypasses the debounce — a player

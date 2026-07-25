@@ -226,6 +226,15 @@ struct DiskController {
         extended = nil
     }
 
+    /// Whether a usable Disk Control interface is registered at all.
+    ///
+    /// Deliberately not inferred from `discCount == 0`: a core that registered
+    /// an interface reporting no images and a core that registered nothing are
+    /// two different sentences to a player — "this game's discs aren't ready"
+    /// against "this core can't change discs" — and the disc UI asks both
+    /// questions on its way to deciding whether to offer a switch.
+    var hasDiskControl: Bool { active != nil }
+
     /// Discs the loaded game exposes; 0 when no interface is registered,
     /// which is every core in this app except Beetle PSX.
     var discCount: Int {
@@ -470,6 +479,15 @@ public final class LibretroCore {
     }
 
     // MARK: disc switching
+
+    /// Whether this core registered a Disk Control interface for the loaded
+    /// game. Answers a different question from `discCount > 0`, which cannot
+    /// distinguish a core with no interface from an interface reporting no
+    /// images — and the disc UI needs both answers.
+    ///
+    /// Not a test for "this is PlayStation": Genesis Plus GX registers one too.
+    /// `PreparedLaunch.discLabels` is the only authority for that.
+    public var hasDiskControl: Bool { diskController.hasDiskControl }
 
     /// Discs the loaded game exposes. 0 for everything that isn't a
     /// multi-disc game running on a core with Disk Control.
