@@ -108,18 +108,59 @@ public enum PS1SaveSyncCause: Equatable, Sendable {
     }
 }
 
-extension PS1SaveSyncCause: CaseIterable {
-    /// Written out rather than synthesized, because `serverError` carries a
-    /// status.
+extension PS1SaveSyncCause {
+    /// The payload-free shadow of `PS1SaveSyncCause`.
     ///
-    /// A new cause cannot be added without landing in this file — the switch in
-    /// `recoverySuggestion` above stops compiling until it is given advice — and
-    /// this is the list that advice is then checked against, so the case belongs
-    /// here too.
-    public static var allCases: [PS1SaveSyncCause] {
-        [.serverUnreachable, .tokenRejected, .anotherDeviceWrote, .serverError(status: 500),
-         .unreadableAnswer, .localWriteFailed, .serverKeptAnOlderVersion, .other]
+    /// It exists so `allCases` can be built rather than written down.
+    /// `serverError` carries a status, so nothing is synthesized for the cause
+    /// itself — and the hand-written list this replaced only guarded one
+    /// direction: a case *dropped* from it was caught by a count assertion, but a
+    /// case *added* to the enum and not to the list passed silently, which is the
+    /// direction that actually happens.
+    ///
+    /// With this, a new cause breaks compilation twice — once at `kind`, once at
+    /// `sample` — and the list grows by construction, with no count to bump.
+    enum Kind: CaseIterable, Hashable {
+        case serverUnreachable, tokenRejected, anotherDeviceWrote, serverError,
+             unreadableAnswer, localWriteFailed, serverKeptAnOlderVersion, other
     }
+
+    /// Which kind this cause is. Exhaustive by the compiler.
+    var kind: Kind {
+        switch self {
+        case .serverUnreachable: return .serverUnreachable
+        case .tokenRejected: return .tokenRejected
+        case .anotherDeviceWrote: return .anotherDeviceWrote
+        case .serverError: return .serverError
+        case .unreadableAnswer: return .unreadableAnswer
+        case .localWriteFailed: return .localWriteFailed
+        case .serverKeptAnOlderVersion: return .serverKeptAnOlderVersion
+        case .other: return .other
+        }
+    }
+}
+
+extension PS1SaveSyncCause.Kind {
+    /// One inhabitant of this kind, which is all `allCases` needs: the status on
+    /// `serverError` is a payload every assertion written over `allCases` is
+    /// deliberately indifferent to.
+    var sample: PS1SaveSyncCause {
+        switch self {
+        case .serverUnreachable: return .serverUnreachable
+        case .tokenRejected: return .tokenRejected
+        case .anotherDeviceWrote: return .anotherDeviceWrote
+        case .serverError: return .serverError(status: 500)
+        case .unreadableAnswer: return .unreadableAnswer
+        case .localWriteFailed: return .localWriteFailed
+        case .serverKeptAnOlderVersion: return .serverKeptAnOlderVersion
+        case .other: return .other
+        }
+    }
+}
+
+extension PS1SaveSyncCause: CaseIterable {
+    /// Every cause, one per `Kind`, by construction.
+    public static var allCases: [PS1SaveSyncCause] { Kind.allCases.map(\.sample) }
 }
 
 /// The refusals this coordinator raises on its own behalf. Errors from the server

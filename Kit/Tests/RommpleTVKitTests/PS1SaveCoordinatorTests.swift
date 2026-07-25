@@ -1136,17 +1136,30 @@ final class PS1SaveCoordinatorTests: XCTestCase {
     /// tests happen to produce: a cause that explains itself and then stops
     /// leaves a player reading an explanation on a screen that is waiting for a
     /// decision, which is the same defect as advice that contradicts its cause.
-    /// `allCases` is hand-written — `serverError` carries a status, so nothing is
-    /// synthesized for it — and a hand-written list can quietly lose a case,
-    /// which would exempt that case from every assertion below. This is the line
-    /// that turns that into a failure.
+    /// `allCases` cannot be synthesized — `serverError` carries a status — so it
+    /// is built from `PS1SaveSyncCause.Kind`, the payload-free shadow of the
+    /// enum, and this pins the two together in both directions:
     ///
-    /// Adding a cause: give it advice (the compiler insists on that much), add it
-    /// to `allCases`, and bump the number here.
+    /// - a case **added** to `PS1SaveSyncCause` stops `var kind` compiling, and a
+    ///   `Kind` added without a `sample` stops that switch compiling, so the list
+    ///   grows by construction rather than by somebody remembering;
+    /// - a `sample` that answers with the *wrong* case — the mistake the compiler
+    ///   cannot see — collapses two kinds onto one and fails the set equality
+    ///   below.
+    ///
+    /// The old spelling was a hand-written array and a hard-coded count of 8.
+    /// That caught a case being dropped and caught a duplicated message, but a
+    /// case added to the enum and not to the array passed both silently, which is
+    /// the direction that actually happens.
     func testAllCasesReallyIsEveryCause() {
-        XCTAssertEqual(PS1SaveSyncCause.allCases.count, 8,
-                       "a cause was added or removed without `allCases` following it")
-        XCTAssertEqual(Set(PS1SaveSyncCause.allCases.map(\.recoverySuggestion)).count, 8,
+        XCTAssertEqual(Set(PS1SaveSyncCause.allCases.map(\.kind)),
+                       Set(PS1SaveSyncCause.Kind.allCases),
+                       "`allCases` does not cover every kind exactly once, so at least one "
+                           + "cause is exempt from every assertion written over it")
+        XCTAssertEqual(PS1SaveSyncCause.allCases.count, PS1SaveSyncCause.Kind.allCases.count,
+                       "`allCases` repeats or omits a kind")
+        XCTAssertEqual(Set(PS1SaveSyncCause.allCases.map(\.recoverySuggestion)).count,
+                       PS1SaveSyncCause.allCases.count,
                        "two causes give the same advice, so at least one of them is wrong "
                            + "about what happened")
     }
