@@ -930,7 +930,7 @@ final class PS1SaveCoordinatorTests: XCTestCase {
             try await coordinator.resolve(token, choice: .local)
             XCTFail("a failed archive must refuse the whole resolution")
         } catch let error as PS1SaveSyncError {
-            XCTAssertEqual(error, .archiveFailed)
+            XCTAssertEqual(error, .archiveFailed(.serverError(status: 500)))
         }
 
         XCTAssertEqual(server.activeUploads.count, 0, "no active upload after a failed archive")
@@ -956,7 +956,7 @@ final class PS1SaveCoordinatorTests: XCTestCase {
         }
         server.setCreateErrors([RommError.http(500)])
         await XCTAssertThrowsErrorAsync(try await coordinator.resolve(token, choice: .remote)) {
-            XCTAssertEqual($0 as? PS1SaveSyncError, .archiveFailed)
+            XCTAssertEqual($0 as? PS1SaveSyncError, .archiveFailed(.serverError(status: 500)))
         }
 
         XCTAssertEqual(store.card(romID), cardB, "the local card must not be replaced")
@@ -984,7 +984,7 @@ final class PS1SaveCoordinatorTests: XCTestCase {
         server.setCreateErrors([nil, RommError.http(500)])
         let statuses = try await drain(coordinator) {
             await XCTAssertThrowsErrorAsync(try await coordinator.resolve(token, choice: .local)) {
-                XCTAssertEqual($0 as? PS1SaveSyncError, .conflictNotResolved)
+                XCTAssertEqual($0 as? PS1SaveSyncError, .conflictNotResolved(.serverError(status: 500)))
             }
         }
 
@@ -1027,7 +1027,7 @@ final class PS1SaveCoordinatorTests: XCTestCase {
         // Archive succeeds; the local write that follows it fails.
         store.saveError = CocoaError(.fileWriteNoPermission)
         await XCTAssertThrowsErrorAsync(try await coordinator.resolve(token, choice: .remote)) {
-            XCTAssertEqual($0 as? PS1SaveSyncError, .conflictNotResolved)
+            XCTAssertEqual($0 as? PS1SaveSyncError, .conflictNotResolved(.localWriteFailed))
         }
 
         let archives = server.archiveUploads
@@ -1042,6 +1042,128 @@ final class PS1SaveCoordinatorTests: XCTestCase {
         try await coordinator.resolve(token, choice: .remote)
         XCTAssertEqual(store.card(romID), cardC)
         XCTAssertEqual(storedBaselineHash, hash(cardC))
+    }
+
+    // MARK: - Why a resolution failed, not just that it did
+
+    /// Every way the server can refuse an archive, and the cause each one has to
+    /// survive as.
+    ///
+    /// The defect this pins is advice that contradicts its own cause: a single
+    /// untyped `archiveFailed` whose recovery text is unconditionally "check your
+    /// connection" tells a player whose token expired to go and look at their
+    /// router. `probeRemote` already branches on `isConnectivityError` before
+    /// deciding `unreachable` versus rethrowing; this is the same rule one layer
+    /// up, where the state ("nothing was changed") has to survive alongside the
+    /// reason.
+    func testAFailedArchiveKeepsWhyItFailed() async throws {
+        let cases: [(Error, PS1SaveSyncCause)] = [
+            (URLError(.notConnectedToInternet), .serverUnreachable),
+            (RommError.http(401), .tokenRejected),
+            (RommError.http(403), .tokenRejected),
+            (RommError.http(500), .serverError(status: 500)),
+            (RommError.badResponse, .unreadableAnswer),
+            (DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "x")),
+             .unreadableAnswer)
+        ]
+        for (thrown, expected) in cases {
+            store = FakeCardStore()
+            server = FakeRomM()
+            store.put(cardB, romID: romID)
+            server.seed(record(id: 700), bytes: cardC)
+            seedBaseline(hash: hash(cardA), remoteID: 700)
+
+            let coordinator = makeCoordinator()
+            guard case let .conflict(token) = try await coordinator.reconcileBeforeLaunch() else {
+                return XCTFail("expected a conflict for \(expected)")
+            }
+            server.setCreateErrors([thrown])
+            await XCTAssertThrowsErrorAsync(
+                try await coordinator.resolve(token, choice: .local)
+            ) {
+                XCTAssertEqual($0 as? PS1SaveSyncError, .archiveFailed(expected),
+                               "\(thrown) was collapsed into the wrong cause")
+            }
+            // The state half of the sentence must survive alongside the reason.
+            XCTAssertEqual(store.card(romID), cardB)
+            XCTAssertEqual(storedBaselineHash, hash(cardA))
+        }
+    }
+
+    /// The point of carrying the cause: the sentence a player reads changes with
+    /// it. An expired token must not be answered with "check your connection",
+    /// and a local write failure must not be answered with anything about the
+    /// network at all.
+    func testTheAdviceMatchesTheCauseRatherThanTheStage() {
+        let offline = PS1SaveSyncError.archiveFailed(.serverUnreachable).recoverySuggestion
+        XCTAssertEqual(offline,
+                       "Check your connection to your RomM server, then choose again.")
+
+        let token = PS1SaveSyncError.archiveFailed(.tokenRejected).recoverySuggestion ?? ""
+        XCTAssertFalse(token.lowercased().contains("connection"), token)
+        XCTAssertTrue(token.contains("token"), token)
+
+        let server = PS1SaveSyncError.conflictNotResolved(.serverError(status: 503))
+            .recoverySuggestion ?? ""
+        XCTAssertFalse(server.lowercased().contains("connection"), server)
+        XCTAssertTrue(server.contains("503"), server)
+
+        let decode = PS1SaveSyncError.conflictNotResolved(.unreadableAnswer)
+            .recoverySuggestion ?? ""
+        XCTAssertFalse(decode.lowercased().contains("connection"), decode)
+
+        let local = PS1SaveSyncError.conflictNotResolved(.localWriteFailed)
+            .recoverySuggestion ?? ""
+        XCTAssertFalse(local.lowercased().contains("connection"), local)
+        XCTAssertFalse(local.lowercased().contains("server"), local)
+
+        // Whatever the cause, the state half of the message is unchanged: an
+        // archive that failed changed nothing, and a stage-2 failure archived the
+        // loser and stopped.
+        for cause in [PS1SaveSyncCause.serverUnreachable, .tokenRejected, .other] {
+            XCTAssertEqual(PS1SaveSyncError.archiveFailed(cause).errorDescription,
+                           PS1SaveSyncError.archiveFailed(.other).errorDescription)
+            XCTAssertEqual(PS1SaveSyncError.conflictNotResolved(cause).errorDescription,
+                           PS1SaveSyncError.conflictNotResolved(.other).errorDescription)
+        }
+    }
+
+    /// Stage 2's local write is not a server failure at all, and used to be
+    /// reported as one.
+    func testAFailedLocalInstallIsNotReportedAsAConnectionProblem() async throws {
+        store.put(cardB, romID: romID)
+        server.seed(record(id: 700), bytes: cardC)
+        seedBaseline(hash: hash(cardA), remoteID: 700)
+
+        let coordinator = makeCoordinator()
+        guard case let .conflict(token) = try await coordinator.reconcileBeforeLaunch() else {
+            return XCTFail("expected a conflict")
+        }
+        store.saveError = CocoaError(.fileWriteNoPermission)
+        await XCTAssertThrowsErrorAsync(try await coordinator.resolve(token, choice: .remote)) {
+            XCTAssertEqual($0 as? PS1SaveSyncError, .conflictNotResolved(.localWriteFailed))
+        }
+    }
+
+    /// The server accepted the upload but kept an older row — the dedup case
+    /// `isAuthoritative` refuses. Nothing about that is a connection problem
+    /// either.
+    func testAnUnauthoritativeCreateSaysTheServerKeptAnOlderCopy() async throws {
+        // The local card is bytes the server already holds under an *older* row,
+        // so the create dedups back to it and cannot outrank the row it replaces.
+        store.put(cardB, romID: romID)
+        server.seed(record(id: 600, updatedAt: "2026-03-01T09:00:00"), bytes: cardB)
+        server.seed(record(id: 700), bytes: cardC)
+        seedBaseline(hash: hash(cardA), remoteID: 700)
+
+        let coordinator = makeCoordinator()
+        guard case let .conflict(token) = try await coordinator.reconcileBeforeLaunch() else {
+            return XCTFail("expected a conflict")
+        }
+        await XCTAssertThrowsErrorAsync(try await coordinator.resolve(token, choice: .local)) {
+            XCTAssertEqual($0 as? PS1SaveSyncError,
+                           .conflictNotResolved(.serverKeptAnOlderVersion))
+        }
     }
 
     // MARK: - Token validity

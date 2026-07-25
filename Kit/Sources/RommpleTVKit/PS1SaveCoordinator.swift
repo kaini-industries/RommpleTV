@@ -41,6 +41,62 @@ public enum PS1SaveSyncStatus: Sendable, Equatable {
 /// quitting is not going to wait out a timer.
 public enum RetryReason: Sendable, Equatable { case launch, pause, quit, background, user }
 
+/// Why a resolution stage could not be carried out.
+///
+/// This exists because the advice a player needs depends entirely on it, while
+/// the *state* they need to be told about — "nothing was changed" against "the
+/// loser was archived and then the change stopped" — depends entirely on the
+/// stage. Collapsing the two into one untyped refusal is how a player whose token
+/// expired gets told to check their router. `probeRemote` already branches on
+/// `seams.isConnectivityError` before deciding `unreachable` versus rethrowing;
+/// this is the same rule where the stage has to survive alongside the reason.
+public enum PS1SaveSyncCause: Equatable, Sendable {
+    /// The device could not reach the server — and nothing else. A reachable
+    /// server behaving badly is one of the cases below.
+    case serverUnreachable
+    /// The server refused this app's access token (401/403).
+    case tokenRejected
+    /// The server answered with a status that is not a refusal of the token.
+    case serverError(status: Int)
+    /// The server answered with something this app could not read: a non-HTTP
+    /// response, or a body that did not decode.
+    case unreadableAnswer
+    /// The winning card could not be written to this device. Not a server
+    /// failure at all, and used to be reported as one.
+    case localWriteFailed
+    /// The upload was accepted but did not become the newest version — RomM
+    /// deduplicated it against an older row. See `isAuthoritative`.
+    case serverKeptAnOlderVersion
+    /// Anything else. No advice beyond trying again is honest for this.
+    case other
+
+    /// What to do about it. Every sentence ends in "choose again", because every
+    /// one of these leaves a conflict that is still resolvable with the same
+    /// token.
+    var recoverySuggestion: String {
+        switch self {
+        case .serverUnreachable:
+            return "Check your connection to your RomM server, then choose again."
+        case .tokenRejected:
+            return "Create a fresh token on your RomM server and enter it in Server Settings, "
+                + "then choose again."
+        case let .serverError(status):
+            return "Your RomM server answered with status \(status). Choose again; if it keeps "
+                + "happening, check your server's logs."
+        case .unreadableAnswer:
+            return "Your RomM server sent an answer RommpleTV could not read, which usually "
+                + "means it is a version RommpleTV does not understand yet."
+        case .localWriteFailed:
+            return "Restart RommpleTV, then choose again."
+        case .serverKeptAnOlderVersion:
+            return "Your RomM server kept an older copy instead of the one RommpleTV sent. "
+                + "Choose again."
+        case .other:
+            return "Choose again."
+        }
+    }
+}
+
 /// The refusals this coordinator raises on its own behalf. Errors from the server
 /// (`RommError.http`, decode failures) are rethrown as themselves so a caller can
 /// tell an expired token from a broken server; only `statuses` is sanitized.
@@ -58,11 +114,14 @@ public enum PS1SaveSyncError: Error, Equatable, Sendable, LocalizedError {
     /// The conflict being resolved no longer describes the two cards on hand. A
     /// fresh conflict is published when there is still one.
     case conflictExpired
-    /// The losing card could not be archived. Nothing was replaced.
-    case archiveFailed
+    /// The losing card could not be archived. Nothing was replaced. The cause
+    /// travels with it: the sentence a player reads is "what happened" from the
+    /// case and "what to do" from the cause, and the second one is wrong for most
+    /// causes if it is written once for the case.
+    case archiveFailed(PS1SaveSyncCause)
     /// The loser was archived but the winner could not be installed. Both cards
     /// are exactly as they were and the conflict is still resolvable.
-    case conflictNotResolved
+    case conflictNotResolved(PS1SaveSyncCause)
     /// The server could not be reached while resolving. Nothing was archived,
     /// nothing was replaced, and the same conflict is still resolvable.
     case serverUnreachableDuringResolution
@@ -97,7 +156,14 @@ public enum PS1SaveSyncError: Error, Equatable, Sendable, LocalizedError {
             return "Check your connection to your RomM server, then try again."
         case .conflictExpired:
             return "Choose again."
-        case .archiveFailed, .conflictNotResolved, .serverUnreachableDuringResolution:
+        case let .archiveFailed(cause), let .conflictNotResolved(cause):
+            // The one place the cause is spent. Every branch of it ends in
+            // "choose again", so the stage's own message still reads as one
+            // sentence with it.
+            return cause.recoverySuggestion
+        case .serverUnreachableDuringResolution:
+            // Not a classified cause: this one is raised only where the probe
+            // already answered `unreachable`, so there is nothing to classify.
             return "Check your connection to your RomM server, then choose again."
         }
     }
@@ -562,7 +628,7 @@ public actor PS1SaveCoordinator {
             _ = try await create(loser, slot: archiveSlot(), autocleanup: false)
         } catch {
             publish(.conflict)
-            throw PS1SaveSyncError.archiveFailed
+            throw PS1SaveSyncError.archiveFailed(cause(of: error))
         }
 
         // ---- Stage 2: install the winner. ------------------------------------
@@ -574,11 +640,13 @@ public actor PS1SaveCoordinator {
                 created = try await create(localBytes, slot: Self.activeSlot, autocleanup: true)
             } catch {
                 publish(.conflict)
-                throw PS1SaveSyncError.conflictNotResolved
+                throw PS1SaveSyncError.conflictNotResolved(cause(of: error))
             }
             guard isAuthoritative(created, replacing: record) else {
                 publish(.conflict)
-                throw PS1SaveSyncError.conflictNotResolved
+                // Not a failure the server reported: it accepted the upload and
+                // answered with a row older than the one being replaced.
+                throw PS1SaveSyncError.conflictNotResolved(.serverKeptAnOlderVersion)
             }
             setBaseline(hash: localHash, record: created)
         case .remote:
@@ -586,7 +654,9 @@ public actor PS1SaveCoordinator {
                 try localStore.save(remoteBytes, romID: canonicalRomID)
             } catch {
                 publish(.conflict)
-                throw PS1SaveSyncError.conflictNotResolved
+                // This device, not the server. Advice about a connection here is
+                // the defect this classification exists to remove.
+                throw PS1SaveSyncError.conflictNotResolved(.localWriteFailed)
             }
             setBaseline(hash: remoteHash, record: record)
         }
@@ -870,6 +940,29 @@ public actor PS1SaveCoordinator {
             throw error
         }
         return .present(record: record, bytes: bytes, hash: Self.sha256(bytes))
+    }
+
+    /// What a server call that threw was actually complaining about.
+    ///
+    /// Connectivity is tested first and by the same seam `probeRemote` uses, so
+    /// one rule decides "the device is offline" everywhere in this file. The rest
+    /// preserves what the layer below already knew: `RommClient` throws
+    /// `RommError.http` with the status and `RommError.badResponse` for a
+    /// non-HTTP answer, and `JSONDecoder` throws `DecodingError` — all three
+    /// reach here verbatim, and all three mean different things to a player.
+    private func cause(of error: Error) -> PS1SaveSyncCause {
+        if seams.isConnectivityError(error) { return .serverUnreachable }
+        if let romm = error as? RommError {
+            switch romm {
+            case .badResponse:
+                return .unreadableAnswer
+            case let .http(status):
+                return status == 401 || status == 403 ? .tokenRejected
+                                                      : .serverError(status: status)
+            }
+        }
+        if error is DecodingError { return .unreadableAnswer }
+        return .other
     }
 
     /// The active card among everything the server holds for this ROM.

@@ -909,7 +909,7 @@ final class LaunchPreparationModelTests: XCTestCase {
         harness.resolveHandler = { _, _ in
             gate.enter()
             await gate.waitUntilOpen()          // deliberately not a cancellation point
-            throw PS1SaveSyncError.archiveFailed
+            throw PS1SaveSyncError.archiveFailed(.serverUnreachable)
         }
         let model = makeModel(request: .playStation(game: makeGame(), platformID: 35))
         model.run()
@@ -1089,7 +1089,7 @@ final class LaunchPreparationModelTests: XCTestCase {
     func testARecoverableResolutionFailureReturnsToTheChooser() async throws {
         let token = PS1SaveConflict(id: UUID(), localModifiedAt: nil, remoteModifiedAt: nil)
         harness.reconcileResult = { .conflict(token) }
-        harness.resolveHandler = { _, _ in throw PS1SaveSyncError.archiveFailed }
+        harness.resolveHandler = { _, _ in throw PS1SaveSyncError.archiveFailed(.serverUnreachable) }
         let model = makeModel(request: .playStation(game: makeGame(), platformID: 35))
         model.run()
         await settle(model) { if case .conflict = $0 { return true }; return false }
@@ -1102,7 +1102,7 @@ final class LaunchPreparationModelTests: XCTestCase {
             return XCTFail("expected the chooser back")
         }
         XCTAssertEqual(published, token)
-        XCTAssertEqual(failure?.message, PS1SaveSyncError.archiveFailed.errorDescription)
+        XCTAssertEqual(failure?.message, PS1SaveSyncError.archiveFailed(.serverUnreachable).errorDescription)
     }
 
     @MainActor
