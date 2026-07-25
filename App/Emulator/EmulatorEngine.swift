@@ -70,11 +70,28 @@ final class EmulatorEngine: NSObject, CoreAVSink {
 
     enum EngineError: LocalizedError {
         case coreNotBundled(String)
+        /// The core would not take the saved card: `cardBytes` on disk against
+        /// `coreBytes` of SAVE_RAM. Carries both numbers because they are the
+        /// whole diagnosis and neither is private — no name, no path, no server.
+        case savedCardRejected(coreBytes: Int, cardBytes: Int)
+
         var errorDescription: String? {
             switch self {
             case .coreNotBundled(let name):
                 return "Core \(name).dylib is not in this build "
                      + "(simulator builds have no cores — run on the Apple TV)."
+            case let .savedCardRejected(coreBytes, cardBytes) where coreBytes == 0:
+                return "There's a saved card for this game (\(cardBytes) bytes), but the "
+                     + "emulator core isn't offering anywhere to put it. RommpleTV stopped "
+                     + "rather than start the game as if the save wasn't there. Launching "
+                     + "again is safe and will say the same thing until the core and the "
+                     + "card agree."
+            case let .savedCardRejected(coreBytes, cardBytes):
+                return "The saved card for this game is \(cardBytes) bytes and the emulator "
+                     + "core expects \(coreBytes), so it couldn't be loaded. RommpleTV "
+                     + "stopped rather than start the game on a blank card and then save "
+                     + "that over the one you have. Launching again is safe and will say "
+                     + "the same thing until the core and the card agree."
             }
         }
     }
@@ -117,6 +134,32 @@ final class EmulatorEngine: NSObject, CoreAVSink {
             // It reaches the player as the "Can't start emulation" screen, which
             // offers a way back to the library and leaves the card untouched.
             restored = try launch.saveStore.load(romID: launch.canonicalRomID)
+            // And a *refused* restore is the same defect one step later, which is
+            // why it is a launch failure and not a state to play through.
+            // `restoreRAM` returns false without writing when the core's SAVE_RAM
+            // is a different size — so the core keeps its power-on card, the
+            // first periodic flush reads that card, sees it differs from the
+            // bytes on disk, and writes it over them. On a PlayStation launch the
+            // upload follows: `EmulatorSaveFlow` schedules it, the blank matches
+            // the baseline the reconcile recorded, so the coordinator takes the
+            // ordinary append branch rather than the conflict one and makes the
+            // blank card the newest version on the server. Nothing archives.
+            //
+            // This became reachable with PlayStation and not before: until the
+            // card could arrive from RomM, the only writer of these bytes was
+            // this device's own core and a size disagreement was impossible. Now
+            // a second Apple TV on a different build — or this one after a core
+            // bump that changes memory-card configuration — produces it.
+            //
+            // Throwing from inside the `do` runs the same `core.unload()` every
+            // other start failure does and reaches the player as "Can't start
+            // emulation", whose promise that "Nothing was changed on this Apple
+            // TV or on your RomM server" is exactly true here: `saveFlow` is
+            // still nil, so the `stop()` that follows has nothing to flush.
+            if let restored, !core.restoreRAM(restored) {
+                throw EngineError.savedCardRejected(coreBytes: core.saveRAM()?.count ?? 0,
+                                                    cardBytes: restored.count)
+            }
         } catch {
             // A constructed core owns the process-wide gCore slot; failing to
             // start must release it or no game can ever start until relaunch.
@@ -125,12 +168,12 @@ final class EmulatorEngine: NSObject, CoreAVSink {
         }
         self.core = core
         self.launch = launch
-        if let restored {
-            core.restoreRAM(restored)
-            // Freshly restored data already matches disk — don't re-flush it
-            // on the very first 600-tick boundary.
-            lastFlushedSRAM = restored
-        }
+        // Freshly restored data already matches disk — don't re-flush it on the
+        // very first 600-tick boundary. Only ever reached when the core took the
+        // bytes: setting this from a refused restore is what turned a mismatch
+        // into a silent overwrite, and not setting it would not have helped
+        // either — the first flush overwrites regardless.
+        if let restored { lastFlushedSRAM = restored }
         // The whole remote half of the save session, in four lines and in one
         // place. `onLocalSave` hands the uploader bytes that are already on disk
         // and lets its debounce decide when they go out; `retrySaveSync` is the

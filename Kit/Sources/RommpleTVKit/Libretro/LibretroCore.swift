@@ -485,8 +485,19 @@ public final class LibretroCore {
         return Data(bytes: ptr, count: size)
     }
 
-    /// Restores battery RAM. Call AFTER loadGame. Returns false on size mismatch.
-    @discardableResult
+    /// Restores battery RAM. Call AFTER loadGame.
+    ///
+    /// - Returns: `false` when the core did **not** take the bytes — either its
+    ///   SAVE_RAM is a different size from `data`, or it exposes none at all. In
+    ///   neither case has anything been written.
+    ///
+    /// Deliberately not `@discardableResult`. A refused restore is not a state to
+    /// play through: the core is left holding whatever it powered on with, and a
+    /// caller that ignores the answer will flush *that* over the card it just
+    /// failed to load. Size disagreement used to be impossible — the only source
+    /// of `.srm` bytes was this device's own core — and is not any more, now that
+    /// a card can arrive from RomM having been written by another Apple TV or by
+    /// a core built with a different memory-card configuration.
     public func restoreRAM(_ data: Data) -> Bool {
         let size = fnGetMemorySize(Self.memorySaveRAM)
         guard size == data.count, size > 0,
