@@ -25,6 +25,15 @@ public enum RetroButton: Int32, CaseIterable, Sendable {
 
 public enum CoreError: Error {
     case dlopenFailed(String), missingSymbol(String), loadGameFailed, alreadyLoaded
+    /// A disc switch was asked for but no Disk Control interface is
+    /// registered: a single-disc game, a core that has none, or an unloaded
+    /// core whose callbacks have already been dropped.
+    case discControlUnavailable
+    /// The requested disc is outside `0..<count` for the loaded game.
+    case discIndexOutOfRange(index: Int, count: Int)
+    /// The core refused one of the eject/insert steps. The disc that was in
+    /// the drive has been put back on a best-effort basis.
+    case discSwitchFailed
 }
 
 extension CoreError: LocalizedError {
@@ -34,7 +43,234 @@ extension CoreError: LocalizedError {
         case .missingSymbol(let name): return "The emulator core is incomplete (missing \(name))."
         case .loadGameFailed: return "The core rejected this ROM file."
         case .alreadyLoaded: return "Another game is still running — back out and try again."
+        case .discControlUnavailable: return "This game doesn't have discs to switch between."
+        case .discIndexOutOfRange(let index, let count):
+            return "There's no disc \(index + 1) in this game (it has \(count))."
+        case .discSwitchFailed:
+            return "The game wouldn't change discs just now — try again in a moment."
         }
+    }
+}
+
+/// What `retro_load_game` is handed for one game.
+///
+/// Which case applies is decided once, when the core is constructed, by the
+/// core's own `retro_system_info.need_fullpath`. `.fullPath` exists because a
+/// `need_fullpath` core opens the file itself: an M3U only names other files,
+/// and a PlayStation disc image runs to hundreds of megabytes, so reading
+/// either into memory is wrong in principle and fatal on an Apple TV.
+enum LoadPayload: Equatable {
+    /// The core reads the game out of `retro_game_info.data`.
+    case inMemory(Data)
+    /// The core opens `retro_game_info.path` itself; no bytes are read here.
+    case fullPath
+}
+
+/// Decides what a game is handed to the core as, knowing nothing about the
+/// core beyond `need_fullpath`.
+///
+/// The data loader is a parameter so that "the full-path branch never reads
+/// content" is an observable property of this type rather than a claim about
+/// a branch buried in `loadGame(at:)`.
+struct LoadPayloadFactory {
+    typealias DataLoader = (URL) throws -> Data
+
+    let needsFullPath: Bool
+    private let loadData: DataLoader
+
+    init(needsFullPath: Bool,
+         loadData: @escaping DataLoader = { try Data(contentsOf: $0) }) {
+        self.needsFullPath = needsFullPath
+        self.loadData = loadData
+    }
+
+    func makePayload(for url: URL) throws -> LoadPayload {
+        guard !needsFullPath else { return .fullPath }
+        return .inMemory(try loadData(url))
+    }
+}
+
+/// Owns a C-string copy of the loaded game's path.
+///
+/// A `need_fullpath` core keeps the path: an M3U core re-opens it to reach
+/// the other discs, so the string has to outlive `retro_load_game`, which a
+/// `withCString` pointer would not. Exactly one owner is assumed — this is
+/// held privately by `LibretroCore` and never copied out.
+struct RetainedPath {
+    /// nil until a path is retained, and again after `release()`.
+    private(set) var pointer: UnsafeMutablePointer<CChar>?
+
+    /// Copies `path`, releasing whatever was retained before it. The pointer
+    /// is nil afterwards only if the allocation failed.
+    mutating func retain(_ path: String) {
+        let copy = strdup(path)
+        release()
+        pointer = copy
+    }
+
+    /// Idempotent, so `unload()` and `deinit` can both run it.
+    mutating func release() {
+        guard let pointer else { return }
+        free(pointer)
+        self.pointer = nil
+    }
+}
+
+/// The frontend half of libretro's Disk Control interface.
+///
+/// A core registers its callbacks through `retro_set_environment`; this value
+/// keeps whichever it registered and runs disc switches against them. The two
+/// interface versions are stored separately and the winner is picked at use
+/// time, which is what makes the extended interface win whenever both are
+/// registered — in either order.
+struct DiskController {
+    /// Answer to `GET_DISK_CONTROL_INTERFACE_VERSION`. Version 1 is what
+    /// tells a core to register the extended interface instead of the
+    /// deprecated one, so this has to be answered before it registers
+    /// anything.
+    static let interfaceVersion: UInt32 = 1
+
+    /// The five entry points this frontend drives. Both interface versions
+    /// declare them identically, which is what lets everything below stay
+    /// unaware of which one registered.
+    struct Callbacks {
+        let setEjectState: @convention(c) (Bool) -> Bool
+        let getEjectState: @convention(c) () -> Bool
+        let getImageIndex: @convention(c) () -> UInt32
+        let setImageIndex: @convention(c) (UInt32) -> Bool
+        let getNumImages: @convention(c) () -> UInt32
+
+        init?(_ callback: retro_disk_control_callback) {
+            self.init(setEjectState: callback.set_eject_state,
+                      getEjectState: callback.get_eject_state,
+                      getImageIndex: callback.get_image_index,
+                      setImageIndex: callback.set_image_index,
+                      getNumImages: callback.get_num_images)
+        }
+
+        init?(_ callback: retro_disk_control_ext_callback) {
+            self.init(setEjectState: callback.set_eject_state,
+                      getEjectState: callback.get_eject_state,
+                      getImageIndex: callback.get_image_index,
+                      setImageIndex: callback.set_image_index,
+                      getNumImages: callback.get_num_images)
+        }
+
+        /// Fails when any entry point this frontend calls is missing, so an
+        /// unusable registration is dropped instead of becoming a null call
+        /// at switch time. libretro calls every pointer in the struct
+        /// mandatory, but the ones never called here are not checked:
+        /// refusing a core over a missing `add_image_index` would turn a
+        /// working disc into an unswitchable one for no benefit.
+        private init?(setEjectState: (@convention(c) (Bool) -> Bool)?,
+                      getEjectState: (@convention(c) () -> Bool)?,
+                      getImageIndex: (@convention(c) () -> UInt32)?,
+                      setImageIndex: (@convention(c) (UInt32) -> Bool)?,
+                      getNumImages: (@convention(c) () -> UInt32)?) {
+            guard let setEjectState, let getEjectState, let getImageIndex,
+                  let setImageIndex, let getNumImages else { return nil }
+            self.setEjectState = setEjectState
+            self.getEjectState = getEjectState
+            self.getImageIndex = getImageIndex
+            self.setImageIndex = setImageIndex
+            self.getNumImages = getNumImages
+        }
+    }
+
+    private var legacy: Callbacks?
+    private var extended: Callbacks?
+
+    /// The interface a switch runs against: extended whenever it exists.
+    private var active: Callbacks? { extended ?? legacy }
+
+    /// Handles the three Disk Control environment commands, or returns nil if
+    /// `command` is not one of them so the caller can fall through to the
+    /// rest of its handling.
+    ///
+    /// The version query deliberately depends on nothing this type has
+    /// stored: the core asks it *before* it registers anything, and a handler
+    /// that consulted registration state would answer "no disk control" to
+    /// the one core that has some.
+    mutating func handleEnvironment(_ command: Int32,
+                                    _ data: UnsafeMutableRawPointer?) -> Bool? {
+        switch command {
+        case RETRO_ENVIRONMENT_GET_DISK_CONTROL_INTERFACE_VERSION:
+            guard let data else { return false }   // nowhere to put the answer
+            data.assumingMemoryBound(to: UInt32.self).pointee = Self.interfaceVersion
+            return true
+        case RETRO_ENVIRONMENT_SET_DISK_CONTROL_INTERFACE:
+            // NULL deregisters, and the call is answered either way.
+            legacy = data.flatMap {
+                Callbacks($0.assumingMemoryBound(to: retro_disk_control_callback.self).pointee)
+            }
+            return true
+        case RETRO_ENVIRONMENT_SET_DISK_CONTROL_EXT_INTERFACE:
+            extended = data.flatMap {
+                Callbacks($0.assumingMemoryBound(to: retro_disk_control_ext_callback.self).pointee)
+            }
+            return true
+        default:
+            return nil
+        }
+    }
+
+    /// Drops both interfaces. Called from `unload()`: once the core's image is
+    /// unmapped these are pointers into nothing, so "never call a core
+    /// callback after unload" has to be structural rather than a rule.
+    mutating func clear() {
+        legacy = nil
+        extended = nil
+    }
+
+    /// Discs the loaded game exposes; 0 when no interface is registered,
+    /// which is every core in this app except Beetle PSX.
+    var discCount: Int {
+        guard let active else { return 0 }
+        return Int(active.getNumImages())
+    }
+
+    /// The disc in the drive, or nil when no interface is registered or no
+    /// disc is inserted — libretro reports the latter as an index at or past
+    /// `get_num_images()`, which is not a disc anything can name.
+    var currentIndex: Int? {
+        guard let active else { return nil }
+        let count = Int(active.getNumImages())
+        let index = Int(active.getImageIndex())
+        return index < count ? index : nil
+    }
+
+    /// Eject, set the index, insert — the order libretro documents, and the
+    /// only order in which `set_image_index` is allowed to be called.
+    ///
+    /// Any step failing after the tray opens leaves the drive in a state
+    /// nobody asked for, so the prior disc goes back and the tray is closed
+    /// again before the error is thrown. That restore is best-effort: if the
+    /// core refuses that too there is nothing further to try.
+    func switchDisc(to index: Int) throws {
+        guard let active else { throw CoreError.discControlUnavailable }
+        let count = Int(active.getNumImages())
+        guard index >= 0, index < count else {
+            throw CoreError.discIndexOutOfRange(index: index, count: count)
+        }
+        let priorIndex = active.getImageIndex()
+        let priorEjected = active.getEjectState()
+
+        // Nothing has changed yet if the tray refuses to open, so there is
+        // nothing to undo.
+        guard active.setEjectState(true) else { throw CoreError.discSwitchFailed }
+        guard active.setImageIndex(UInt32(index)) else {
+            Self.restore(active, index: priorIndex, ejected: priorEjected)
+            throw CoreError.discSwitchFailed
+        }
+        guard active.setEjectState(false) else {
+            Self.restore(active, index: priorIndex, ejected: priorEjected)
+            throw CoreError.discSwitchFailed
+        }
+    }
+
+    private static func restore(_ callbacks: Callbacks, index: UInt32, ejected: Bool) {
+        _ = callbacks.setImageIndex(index)
+        _ = callbacks.setEjectState(ejected)
     }
 }
 
@@ -44,12 +280,24 @@ public final class LibretroCore {
     public private(set) var pixelFormat: CorePixelFormat = .rgb1555  // libretro default
 
     private let handle: UnsafeMutableRawPointer
-    private var romData: Data?                 // kept alive: cores may reference it
+    // The two things a loaded game may need kept alive. Which one is in use
+    // is decided by the core's `need_fullpath`; both are cleared when a load
+    // fails and when the core unloads. Readable in-module (not private) so
+    // that the retention rules can be observed rather than asserted.
+    private(set) var romData: Data?            // kept alive: cores may reference it
+    private(set) var gamePath = RetainedPath()
     private let systemDirC: UnsafeMutablePointer<CChar>
     private let saveDirC: UnsafeMutablePointer<CChar>
+    private let payloadFactory: LoadPayloadFactory
+    private var diskController = DiskController()
     fileprivate var buttons = [Int16](repeating: 0, count: 16)
     private var gameLoaded = false
     private var isUnloaded = false
+
+    /// What this core answered for `retro_system_info.need_fullpath`: whether
+    /// it wants to be handed a path (Beetle PSX) or bytes (every other core
+    /// this app ships).
+    var needsFullPath: Bool { payloadFactory.needsFullPath }
 
     // dlsym'd entry points
     private typealias VoidFn = @convention(c) () -> Void
@@ -87,6 +335,15 @@ public final class LibretroCore {
         fnGetMemorySize = try sym("retro_get_memory_size",
             (@convention(c) (UInt32) -> Int).self)
 
+        // `retro_get_system_info` is documented as callable at any time, even
+        // before `retro_init`, and its answer is static — so ask once, here,
+        // and let it decide how every game is handed over.
+        let getSystemInfo = try sym("retro_get_system_info",
+            (@convention(c) (UnsafeMutablePointer<retro_system_info>?) -> Void).self)
+        var systemInfo = retro_system_info()
+        getSystemInfo(&systemInfo)
+        payloadFactory = LoadPayloadFactory(needsFullPath: systemInfo.need_fullpath)
+
         systemDirC = strdup(systemDirectory.path)
         saveDirC = strdup(saveDirectory.path)
 
@@ -121,18 +378,45 @@ public final class LibretroCore {
         fnInit()
     }
 
+    /// The `retro_game_info` a `need_fullpath` core must receive: the path and
+    /// nothing else. libretro documents `data`/`size` as invalid in that case,
+    /// and filling them in is exactly the several-hundred-megabyte read this
+    /// branch exists to avoid.
+    static func fullPathGameInfo(path: UnsafePointer<CChar>) -> retro_game_info {
+        retro_game_info(path: path, data: nil, size: 0, meta: nil)
+    }
+
+    /// Hands the game to the core the way the core asked to receive it.
     public func loadGame(at romURL: URL) throws {
-        let data = try Data(contentsOf: romURL)
-        romData = data
+        let payload = try payloadFactory.makePayload(for: romURL)
         var loaded = false
-        romURL.path.withCString { pathC in
-            data.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
-                var info = retro_game_info(path: pathC, data: buf.baseAddress,
-                                           size: buf.count, meta: nil)
-                loaded = fnLoadGame(&info)
+        switch payload {
+        case .inMemory(let data):
+            // Unchanged from the pre-PlayStation implementation, deliberately:
+            // every 2D core in this app loads through these lines, and the
+            // pointer the core receives is only valid inside both closures.
+            romData = data
+            romURL.path.withCString { pathC in
+                data.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
+                    var info = retro_game_info(path: pathC, data: buf.baseAddress,
+                                               size: buf.count, meta: nil)
+                    loaded = fnLoadGame(&info)
+                }
             }
+        case .fullPath:
+            // The core opens this path itself and keeps re-opening it — an
+            // M3U names the other discs — so it must outlive this call.
+            gamePath.retain(romURL.path)
+            guard let pathC = gamePath.pointer else { throw CoreError.loadGameFailed }
+            var info = Self.fullPathGameInfo(path: pathC)
+            loaded = fnLoadGame(&info)
         }
-        guard loaded else { throw CoreError.loadGameFailed }
+        guard loaded else {
+            // Nothing is loaded, so nothing may still be held on its behalf.
+            romData = nil
+            gamePath.release()
+            throw CoreError.loadGameFailed
+        }
         gameLoaded = true
         var av = retro_system_av_info()
         fnGetAVInfo(&av)
@@ -176,21 +460,51 @@ public final class LibretroCore {
         buttons[Int(button.rawValue)] = pressed ? 1 : 0
     }
 
+    // MARK: disc switching
+
+    /// Discs the loaded game exposes. 0 for everything that isn't a
+    /// multi-disc game running on a core with Disk Control.
+    public var discCount: Int { diskController.discCount }
+
+    /// The disc currently in the drive, or nil when there is no disc control
+    /// or nothing is inserted.
+    public var currentDiscIndex: Int? { diskController.currentIndex }
+
+    /// Swaps the disc in the drive, throwing without leaving the drive empty
+    /// if the core refuses.
+    ///
+    /// Main thread only, like every other entry point here: `EmulatorEngine`
+    /// owns this object and must never run a switch alongside `runFrame()`.
+    public func switchDisc(to index: Int) throws {
+        try diskController.switchDisc(to: index)
+    }
+
     public func unload() {
         guard !isUnloaded else { return }
         isUnloaded = true
         if gameLoaded { fnUnloadGame(); gameLoaded = false }
+        // Drop the core's disk-control callbacks before its image goes away:
+        // past this point they address unmapped code.
+        diskController.clear()
         fnDeinit()
         dlclose(handle)
         romData = nil
+        gamePath.release()
         if gCore === self { gCore = nil }
     }
 
-    deinit { free(systemDirC); free(saveDirC) }
+    deinit { free(systemDirC); free(saveDirC); gamePath.release() }
 
     // MARK: environment handling (called from C)
-    fileprivate func environment(_ cmd: UInt32, _ data: UnsafeMutableRawPointer?) -> Bool {
-        switch Int32(cmd & 0xFFFF) {   // mask experimental flag
+    // Internal rather than fileprivate because this is the only way a core's
+    // disk-control callbacks are ever registered: tests drive registration
+    // through the real handler instead of through a hook added for them.
+    func environment(_ cmd: UInt32, _ data: UnsafeMutableRawPointer?) -> Bool {
+        let command = Int32(cmd & 0xFFFF)   // mask experimental flag
+        // Disk Control first, and unconditionally: the version query arrives
+        // before the core registers anything.
+        if let answer = diskController.handleEnvironment(command, data) { return answer }
+        switch command {
         case RETRO_ENVIRONMENT_GET_CAN_DUPE:
             data?.assumingMemoryBound(to: Bool.self).pointee = true; return true
         case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT:
