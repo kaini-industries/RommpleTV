@@ -26,6 +26,19 @@ struct EmulatorHostView: View {
     /// the game is loaded. `nil` until then, and — by construction — a state that
     /// shows nothing at all for a legacy or single-disc launch.
     @State private var discFlow: DiscSwitchFlow?
+    /// The flow's `availability`, mirrored into this view's own state.
+    ///
+    /// Not redundant with `discFlow`: `@State` holding a reference type does not
+    /// subscribe to that object's `@Published` output, so a body reading
+    /// `discFlow?.canSwitch` reads whatever was true when the body ran and never
+    /// re-runs when it changes. `reresolve()` is called from
+    /// `onChange(of: showOverlay)`, which fires *after* the body that built the
+    /// overlay — so before this, a core that registered its Disk Control
+    /// interface late got its **Change Disc** button on the second pause, not
+    /// the first. (`DiscStatusView` has `@ObservedObject` and always followed,
+    /// which is why the note and the current-disc line looked right while the
+    /// button was missing.) Republished in the same statement that re-resolves.
+    @State private var discAvailability: DiscSwitchAvailability = .single
     /// Whether the disc picker is on top of the pause overlay. Only ever true
     /// while `showOverlay` is, so the game is stopped for the whole of it.
     @State private var showDiscPicker = false
@@ -45,6 +58,7 @@ struct EmulatorHostView: View {
                                            onEngineReady: {
                                                engine = $0
                                                discFlow = $0.discFlow
+                                               discAvailability = $0.discFlow?.availability ?? .single
                                            },
                                            onOverlayRequested: toggleOverlay,
                                            onPauseRequested: forceShowOverlay,
@@ -63,6 +77,7 @@ struct EmulatorHostView: View {
                             PauseOverlayView(
                                 saveFailure: saveFailure,
                                 discs: discFlow,
+                                discAvailability: discAvailability,
                                 syncStatus: syncStatus,
                                 onResume: resumeAndHideOverlay,
                                 onRestart: {
@@ -101,12 +116,18 @@ struct EmulatorHostView: View {
                 // registered its Disk Control interface later than that would
                 // otherwise be stuck reporting no discs for the whole session
                 // with no button, no picker and nothing that ever looks again.
-                // The disc section observes the flow, so a state that changes
-                // here redraws without any further help.
+                //
+                // The re-resolve and the republish are one statement apart on
+                // purpose. `DiscStatusView` observes the flow and would follow on
+                // its own, but the **Change Disc** button is decided in this
+                // view's body, and this closure runs after that body — so the new
+                // answer has to arrive as this view's own state or the button
+                // waits for the next pause. See `discAvailability`.
                 .onChange(of: showOverlay) { _, isShowing in
                     guard isShowing else { return }
                     deliverUnwrittenCardNote()
                     discFlow?.reresolve()
+                    discAvailability = discFlow?.availability ?? .single
                 }
                 .onChange(of: scenePhase) { _, phase in
                     guard phase != .active else { return }
@@ -308,6 +329,16 @@ struct PauseOverlayView: View {
     /// is every launch until the game has loaded. A flow whose availability is
     /// `.single` shows nothing either, which is every legacy and one-disc game.
     var discs: DiscSwitchFlow?
+    /// The same flow's availability, handed over as a value.
+    ///
+    /// The two decisions this view takes about discs — whether there is a section
+    /// at all, and whether **Change Disc** is offered — are taken from here and
+    /// not from `discs`, because they are taken *in this body*: the host holds
+    /// the flow in `@State`, which does not observe it, and re-resolves it after
+    /// this body has already run. Reading them off the object would show the
+    /// previous pause's answer. `DiscStatusView` below keeps reading the flow,
+    /// which it may: it observes.
+    var discAvailability: DiscSwitchAvailability = .single
     /// Where the memory card's server half stands. `.idle` shows nothing, and is
     /// what a legacy launch always has.
     var syncStatus: PS1SaveSyncStatus = .idle
@@ -346,7 +377,7 @@ struct PauseOverlayView: View {
                     }
                     .frame(maxWidth: 900)
                 }
-                if let discs, discs.showsDiscSection {
+                if let discs, discAvailability.isVisible {
                     DiscStatusView(flow: discs)
                 }
                 if let message = syncStatus.overlayMessage {
@@ -363,7 +394,11 @@ struct PauseOverlayView: View {
                 // agree — see `DiscSwitchAvailability.resolve`. `select` refuses
                 // on the same state, so hiding the button is not what makes a
                 // disabled session safe.
-                if let discs, discs.canSwitch {
+                // `discs != nil` as well, so the button still cannot be offered
+                // without a flow for it to act on. The two can only agree — both
+                // are published together — but the pairing is what makes that
+                // structural rather than a fact about two call sites.
+                if discs != nil, discAvailability.offersSwitching {
                     Button("Change Disc", action: onChangeDisc)
                         .focused($focused, equals: .changeDisc)
                         .accessibilityIdentifier("pause.changeDisc")
