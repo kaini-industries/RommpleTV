@@ -63,6 +63,9 @@ public enum PS1SaveSyncError: Error, Equatable, Sendable, LocalizedError {
     /// The loser was archived but the winner could not be installed. Both cards
     /// are exactly as they were and the conflict is still resolvable.
     case conflictNotResolved
+    /// The server could not be reached while resolving. Nothing was archived,
+    /// nothing was replaced, and the same conflict is still resolvable.
+    case serverUnreachableDuringResolution
 
     public var errorDescription: String? {
         switch self {
@@ -81,6 +84,8 @@ public enum PS1SaveSyncError: Error, Equatable, Sendable, LocalizedError {
         case .conflictNotResolved:
             return "RommpleTV saved a copy of the memory card you are replacing, "
                 + "but could not finish the change."
+        case .serverUnreachableDuringResolution:
+            return "RommpleTV cannot reach your RomM server, so nothing was changed."
         }
     }
 
@@ -92,7 +97,7 @@ public enum PS1SaveSyncError: Error, Equatable, Sendable, LocalizedError {
             return "Check your connection to your RomM server, then try again."
         case .conflictExpired:
             return "Choose again."
-        case .archiveFailed, .conflictNotResolved:
+        case .archiveFailed, .conflictNotResolved, .serverUnreachableDuringResolution:
             return "Check your connection to your RomM server, then choose again."
         }
     }
@@ -253,6 +258,7 @@ public actor PS1SaveCoordinator {
     private var pendingHash: String?
     private var uploadGeneration = 0
     private var debounceTask: Task<Void, Never>?
+    private var flushTask: Task<Void, Never>?
     private var didAttemptRegistration = false
     private var registeredDeviceID: String?
 
@@ -529,6 +535,14 @@ public actor PS1SaveCoordinator {
             throw PS1SaveSyncError.conflictExpired
         }
         let probe = try await probeRemote()
+        if case .unreachable = probe {
+            // Nothing was asked of the server and nothing was replaced. The two
+            // cards are still the ones this token names, so it stays valid — a
+            // blip while the chooser is on screen must not make the player start
+            // over.
+            publish(.conflict)
+            throw PS1SaveSyncError.serverUnreachableDuringResolution
+        }
         guard case let .present(record, remoteBytes, remoteHash) = probe,
               record.id == held.remoteID, remoteHash == held.remoteHash else {
             retained = nil
@@ -589,6 +603,16 @@ public actor PS1SaveCoordinator {
     /// Records a newer card and arms the debounce. Cheap and non-blocking: this
     /// is called from the emulator's flush, which runs on the main thread.
     ///
+    /// **The caller must have written these bytes to `localStore` first, and only
+    /// call this if that write succeeded.** This is a binding rule, not a
+    /// convention. `data` is taken at its word and preferred over the stored card
+    /// until the upload settles, so bytes that never reached the local file would
+    /// be uploaded, clear the pending flag, and record a baseline the local card
+    /// does not match — after which the next reconciliation reads "local changed,
+    /// remote did not" and uploads the *older* card over the newer remote one.
+    /// `EmulatorEngine.flushSRAMIfNeeded` therefore calls this only inside the
+    /// `do` block, after `try save` has returned.
+    ///
     /// The bytes are kept in memory, never in UserDefaults. The *flag* is
     /// persisted, so a cold start after a crash knows there is an upload owed and
     /// re-reads the card from `localStore`.
@@ -596,7 +620,12 @@ public actor PS1SaveCoordinator {
         pendingBytes = data
         pendingHash = Self.sha256(data)
         setPending(true)
-        publish(.pending)
+        // An outstanding conflict outranks an owed upload in the published
+        // vocabulary too. Saying `.pending` here would leave the stream and
+        // `status` claiming an upload is on its way while a conflict is waiting on
+        // a person, and `flush` returns without publishing anything, so nothing
+        // would put it back.
+        publish(retained == nil ? .pending : .conflict)
         uploadGeneration &+= 1
         let generation = uploadGeneration
         debounceTask = Task { [weak self, seams] in
@@ -609,7 +638,9 @@ public actor PS1SaveCoordinator {
     public func retryPending(reason: RetryReason) async {
         guard retained == nil else {
             // An outstanding conflict outranks a pending upload: uploading now
-            // would be choosing a side on the player's behalf.
+            // would be choosing a side on the player's behalf. `flush` refuses
+            // independently; this is the same rule stated where a reader looks
+            // for it.
             publish(.conflict)
             return
         }
@@ -625,15 +656,55 @@ public actor PS1SaveCoordinator {
         await flush()
     }
 
-    /// One upload attempt for the pending card.
+    /// Runs at most one upload attempt at a time.
+    ///
+    /// Actor isolation protects each state *access*; it does not protect a
+    /// multi-step operation across its awaits, and `performFlush` suspends twice —
+    /// at the probe and at the create. `retryPending(.pause)` followed by
+    /// `retryPending(.background)` is an ordinary sequence on tvOS, and the flag is
+    /// not cleared until an upload succeeds, so the second call gets past
+    /// `guard isPending`. Two flushes then interleave like this:
+    ///
+    /// 1. the first lists and downloads the active record and finds it matches the
+    ///    baseline;
+    /// 2. the second lists and downloads the same record;
+    /// 3. the first creates a newer record and moves the baseline onto it;
+    /// 4. the second resumes and compares the record it downloaded against the
+    ///    baseline the first one just wrote — they differ, so it publishes a
+    ///    conflict between the player's current card and a stale copy of that same
+    ///    card.
+    ///
+    /// Choosing `remote` there archives the live card and writes the stale one
+    /// over it: a session silently reverted, recoverable only out of a
+    /// `conflict-` slot. So a second caller waits for the first rather than
+    /// starting its own; the pending card is the same one either way, and a card
+    /// that arrived in between keeps the flag set for the debounce it armed.
+    private func flush() async {
+        if let existing = flushTask {
+            await existing.value
+            return
+        }
+        let task = Task { await self.performFlush() }
+        flushTask = task
+        defer { flushTask = nil }
+        await task.value
+    }
+
+    /// One upload attempt for the pending card. Only ever entered through
+    /// `flush()`, which serializes it.
     ///
     /// Reloads the active record first and compares its bytes to the baseline.
     /// That client-side check — not the server's 409 — is the primary lost-update
     /// detector, which matters because the 409 needs a registered device and
     /// registration is allowed to fail. The 409 remains the backstop for the race
     /// between this check and the POST that follows it.
-    private func flush() async {
+    private func performFlush() async {
         guard isPending, retained == nil else { return }
+        // A cold start that retries before it ever prepares a launch would
+        // otherwise download and upload anonymously for that whole pass, which
+        // costs the server's conflict detection exactly when a crash has just made
+        // it most relevant. Idempotent: at most one attempt per instance.
+        await ensureDeviceRegistered()
         guard let bytes = loadPendingBytes() else { return }
         let hash = Self.sha256(bytes)
         publish(.syncing)

@@ -84,6 +84,8 @@ actor Gate {
         pending.forEach { $0.resume() }
     }
 
+    func arrivalCount() -> Int { arrivals }
+
     /// Suspends until at least `count` callers have reached `wait()`.
     func untilArrivals(_ count: Int) async {
         if arrivals >= count { return }
@@ -129,11 +131,16 @@ final class FakeRomM: @unchecked Sendable {
         get { lock.withLock { _createGate } }
         set { lock.withLock { _createGate = newValue } }
     }
+    var downloadGate: Gate? {
+        get { lock.withLock { _downloadGate } }
+        set { lock.withLock { _downloadGate = newValue } }
+    }
     private var _listError: Error?
     private var _downloadError: Error?
     private var _deviceListError: Error?
     private var _registerError: Error?
     private var _createGate: Gate?
+    private var _downloadGate: Gate?
 
     var saves: [RommSave] { lock.withLock { _saves } }
     var blobs: [Int: Data] { lock.withLock { _blobs } }
@@ -172,8 +179,16 @@ final class FakeRomM: @unchecked Sendable {
         }
     }
 
-    func download(_ id: Int, deviceID: String?) throws -> Data {
-        try lock.withLock {
+    func removeSave(_ id: Int) {
+        lock.withLock {
+            _saves.removeAll { $0.id == id }
+            _blobs[id] = nil
+        }
+    }
+
+    func download(_ id: Int, deviceID: String?) async throws -> Data {
+        if let gate = downloadGate { await gate.wait() }
+        return try lock.withLock {
             _downloads.append((id, deviceID))
             if let _downloadError { throw _downloadError }
             guard let blob = _blobs[id] else { throw RommError.http(404) }
@@ -281,7 +296,7 @@ final class PS1SaveCoordinatorTests: XCTestCase {
         let server = self.server!
         return PS1SaveSeams(
             listSaves: { try server.list($0) },
-            downloadSave: { try server.download($0, deviceID: $1) },
+            downloadSave: { try await server.download($0, deviceID: $1) },
             createSave: { try await server.create($0) },
             listDevices: { try server.listDevices() },
             registerDevice: { try server.register($0) },
@@ -1318,6 +1333,158 @@ final class PS1SaveCoordinatorTests: XCTestCase {
         }
         XCTAssertEqual(server.activeUploads[0].data, cardA)
         XCTAssertTrue(storedPending, "the newer card is still owed")
+    }
+
+    // MARK: - One flush at a time
+
+    /// Two retries are an ordinary tvOS sequence (pause, then background), and the
+    /// pending flag is not cleared until an upload succeeds, so both get past
+    /// `guard isPending`. Actor isolation protects each state access but not the
+    /// operation across its awaits, and unserialized the second one compares the
+    /// record it downloaded against the baseline the first one has since written —
+    /// producing a conflict between the player's live card and a stale copy of
+    /// that same card. Choosing `remote` there reverts their session.
+    func testASecondRetryNeverConflictsWithTheFirstRetrysOwnUpload() async throws {
+        let downloadGate = Gate()
+        server.downloadGate = downloadGate
+        server.seed(record(id: 5), bytes: cardA)
+        seedBaseline(hash: hash(cardA), remoteID: 5)
+        store.put(cardB, romID: romID)
+
+        let coordinator = makeCoordinator(seams(sleepGate: Gate()))
+        await coordinator.scheduleUpload(cardB)
+
+        let pause = Task { await coordinator.retryPending(reason: .pause) }
+        await downloadGate.untilArrivals(1)
+        let background = Task { await coordinator.retryPending(reason: .background) }
+        // Bounded rather than a condition wait: serialized, the second retry never
+        // reaches the server at all, so waiting for a second arrival would hang.
+        var spins = 0
+        while await downloadGate.arrivalCount() < 2, spins < 200 {
+            await Task.yield()
+            spins += 1
+        }
+        await downloadGate.release()
+        await pause.value
+        await background.value
+
+        XCTAssertEqual(server.activeUploads.count, 1, "two retries must not both upload")
+        let standing = await coordinator.status
+        XCTAssertEqual(standing, .synced,
+                       "a device must never end up in conflict with its own upload")
+        XCTAssertEqual(store.card(romID), cardB, "the live card must not be reverted")
+        XCTAssertFalse(storedPending)
+        XCTAssertEqual(storedBaselineHash, hash(cardB))
+    }
+
+    /// An owed upload must not displace an outstanding conflict in the published
+    /// vocabulary. `performFlush` returns without publishing anything, so nothing
+    /// would put `.conflict` back, and a stream-driven chooser would dismiss.
+    ///
+    /// The same test pins the guard inside `performFlush`: after a 409 the retained
+    /// record still matches the baseline, so the pre-upload comparison would wave
+    /// this upload through on its own.
+    func testAnUploadScheduledDuringAConflictNeitherPublishesNorUploads() async throws {
+        store.put(cardB, romID: romID)
+        seedBaseline(hash: hash(cardA), remoteID: 700)
+        server.seed(record(id: 700), bytes: cardA)
+        server.setCreateErrors([RommError.http(409)])
+
+        let gate = Gate()
+        let coordinator = makeCoordinator(seams(sleepGate: gate))
+        await coordinator.scheduleUpload(cardB)
+        await coordinator.retryPending(reason: .quit)
+
+        let afterConflict = server.activeUploads.count
+        let standing = await coordinator.status
+        XCTAssertEqual(standing, .conflict)
+
+        // The next frame flush arms the debounce again.
+        await coordinator.scheduleUpload(cardB)
+        let duringConflict = await coordinator.status
+        XCTAssertEqual(duringConflict, .conflict,
+                       "an owed upload must not displace an outstanding conflict")
+        await gate.release()
+        await coordinator.drainDebounce()
+
+        XCTAssertEqual(server.activeUploads.count, afterConflict,
+                       "nothing may be uploaded while a conflict is outstanding")
+        XCTAssertEqual(store.card(romID), cardB)
+        XCTAssertEqual(server.blobs[700], cardA)
+        let settled = await coordinator.status
+        XCTAssertEqual(settled, .conflict)
+    }
+
+    // MARK: - Resolution against a server that moved or went away
+
+    /// A blip while the chooser is on screen must not make the player start over:
+    /// nothing was asked of the server, so the two cards are still the ones the
+    /// token names.
+    func testAnUnreachableServerWhileChoosingKeepsTheToken() async throws {
+        store.put(cardB, romID: romID)
+        server.seed(record(id: 700), bytes: cardC)
+        seedBaseline(hash: hash(cardA), remoteID: 700)
+
+        let coordinator = makeCoordinator()
+        guard case let .conflict(token) = try await coordinator.reconcileBeforeLaunch() else {
+            return XCTFail("expected a conflict")
+        }
+        server.listError = offline()
+        await XCTAssertThrowsErrorAsync(try await coordinator.resolve(token, choice: .remote)) {
+            XCTAssertEqual($0 as? PS1SaveSyncError, .serverUnreachableDuringResolution)
+        }
+        XCTAssertEqual(server.uploadCount, 0, "nothing was archived")
+        XCTAssertEqual(store.card(romID), cardB, "nothing was replaced")
+        let standing = await coordinator.status
+        XCTAssertEqual(standing, .conflict)
+
+        // And the very same token resolves once the server is back.
+        server.listError = nil
+        try await coordinator.resolve(token, choice: .remote)
+        XCTAssertEqual(store.card(romID), cardC)
+        XCTAssertEqual(server.archiveUploads.count, 1)
+    }
+
+    /// The remote half of the token is gone. There is nothing to archive against
+    /// and nothing to install, so the token is retired rather than acted on.
+    func testARecordThatVanishedWhileChoosingRetiresTheToken() async throws {
+        store.put(cardB, romID: romID)
+        server.seed(record(id: 700), bytes: cardC)
+        seedBaseline(hash: hash(cardA), remoteID: 700)
+
+        let coordinator = makeCoordinator()
+        guard case let .conflict(token) = try await coordinator.reconcileBeforeLaunch() else {
+            return XCTFail("expected a conflict")
+        }
+        server.removeSave(700)
+        await XCTAssertThrowsErrorAsync(try await coordinator.resolve(token, choice: .local)) {
+            XCTAssertEqual($0 as? PS1SaveSyncError, .conflictExpired)
+        }
+        XCTAssertEqual(server.uploadCount, 0, "a token whose remote half is gone archives nothing")
+        XCTAssertEqual(store.card(romID), cardB)
+        let standing = await coordinator.status
+        XCTAssertEqual(standing, .failed)
+    }
+
+    /// A crash leaves the flag set; the next run may retry before it ever prepares
+    /// a launch. Without registering here that whole pass is anonymous, which is
+    /// exactly when the server's conflict detection matters most.
+    func testAColdStartRetryRegistersTheDeviceBeforeItSyncs() async throws {
+        defaults.set(true, forKey: "ps1sync.rom.\(romID).pending")
+        store.put(cardA, romID: romID)
+        server.seed(record(id: 700), bytes: cardA)
+
+        let coordinator = makeCoordinator()
+        await coordinator.retryPending(reason: .launch)
+
+        XCTAssertEqual(server.registrations,
+                       ["rommpletv-00000000-1111-2222-3333-444444444444"])
+        let resolved = await coordinator.deviceID
+        XCTAssertEqual(resolved, "device-1")
+        let downloads = server.downloads
+        guard downloads.count == 1 else { return XCTFail("expected one download") }
+        XCTAssertEqual(downloads[0].deviceID, "device-1",
+                       "a cold-start sync must identify itself or every later upload 409s")
     }
 
     // MARK: - Lost updates
