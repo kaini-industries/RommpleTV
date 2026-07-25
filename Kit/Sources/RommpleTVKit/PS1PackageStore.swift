@@ -901,9 +901,32 @@ public actor PS1PackageStore {
         }
     }
 
+    /// Free bytes on the volume `url` lives on.
+    ///
+    /// Two answers, because the platforms do not offer the same one.
+    /// `volumeAvailableCapacityForImportantUsage` is the better figure — it counts
+    /// space the system would reclaim by purging, which is exactly the space a game
+    /// download is allowed to take — but the key is unavailable on tvOS and
+    /// watchOS, so there the only figure is `systemFreeSize`.
+    ///
+    /// The asymmetry is deliberate and worth naming: `systemFreeSize` does **not**
+    /// count purgeable space, so it under-reports on the one platform whose cache
+    /// is purgeable. Under-reporting is the direction to be wrong in for a
+    /// preflight — it refuses a download that might have fitted rather than
+    /// starting one that will not, and a refusal is a sentence the player can act
+    /// on while a half-written package is not.
     static func freeBytes(on url: URL) throws -> Int64 {
+        #if !os(tvOS) && !os(watchOS)
         let values = try url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
         if let capacity = values.volumeAvailableCapacityForImportantUsage { return capacity }
+        #endif
+        return try fileSystemFreeBytes(on: url)
+    }
+
+    /// The figure every platform has, and the only one tvOS has. Split out so the
+    /// branch the tvOS app actually takes is reachable from a test running on
+    /// macOS, where the `#if` above would otherwise compile it away.
+    static func fileSystemFreeBytes(on url: URL) throws -> Int64 {
         let attributes = try FileManager.default.attributesOfFileSystem(forPath: url.path)
         return (attributes[.systemFreeSize] as? NSNumber)?.int64Value ?? 0
     }

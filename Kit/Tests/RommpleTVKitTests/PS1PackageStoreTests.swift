@@ -2013,6 +2013,28 @@ final class PS1PackageStoreTests: XCTestCase {
         XCTAssertNil(invalidation(at: package, for: singleDiscGame()))
     }
 
+    // MARK: - Measuring the real volume
+
+    func testFreeBytesMeasuresTheVolumeAndReportsBothPlatformFigures() throws {
+        // Every capacity test injects `measure`, so this is the only coverage the
+        // production measurement path gets — which is how a key that is unavailable
+        // on tvOS survived a green suite on macOS.
+        let directory = try tempDirectory()
+
+        let free = try PS1PackageStore.freeBytes(on: directory)
+        XCTAssertGreaterThan(free, 0)
+
+        // The tvOS branch, exercised here on macOS: on tvOS this *is* `freeBytes`.
+        let fileSystemFree = try PS1PackageStore.fileSystemFreeBytes(on: directory)
+        XCTAssertGreaterThan(fileSystemFree, 0)
+
+        // Unmeasurable is not "no room": it throws, so a prepare fails rather than
+        // silently treating the volume as full or as empty.
+        let missing = directory.appendingPathComponent("no-such-volume", isDirectory: true)
+        XCTAssertThrowsError(try PS1PackageStore.freeBytes(on: missing))
+        XCTAssertThrowsError(try PS1PackageStore.fileSystemFreeBytes(on: missing))
+    }
+
     // MARK: - Rehashing
 
     func testStreamingSHA1AgreesWithTheFullDigest() throws {
