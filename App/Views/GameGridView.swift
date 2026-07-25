@@ -1,15 +1,23 @@
 import SwiftUI
 import RommpleTVKit
 
-/// Decoded cover artwork for the page on screen and the one just left.
+/// Decoded cover artwork for the page on screen and, as far as the budget
+/// stretches, the one just left.
 ///
 /// The grid no longer holds a whole platform in memory, so the artwork behind
-/// it must not either. `countLimit` is two full pages at the largest offered
-/// page size (2 × 96 = 192): the visible page plus the one the user paged away
-/// from, which is the page they are most likely to come straight back to.
-/// `totalCostLimit` is 64 MiB of *decoded* pixels, the memory a cover actually
-/// occupies once it is a `UIImage` and the figure that has to fit inside a tvOS
-/// app's footprint. This cache is in-memory only; nothing here is written to
+/// it must not either. Two limits bound it, and they are not equal partners:
+///
+/// - `totalCostLimit` is 64 MiB of *decoded* pixels — the memory a cover
+///   actually occupies once it is a `UIImage`, and the figure that has to fit
+///   inside a tvOS app's footprint. This is the limit that binds in practice.
+/// - `countLimit = 192` is 2 × 96, the largest offered page size doubled. It is
+///   an upper bound on entries, not an achievable depth: 64 MiB spread over 192
+///   entries budgets only ~341 KB each, about a 295 × 295 RGBA image, and RomM's
+///   `small.png` covers decode larger than that. Real depth is therefore closer
+///   to a single page at 96 than to two.
+///
+/// Cost is the budget; count is the backstop for images whose decoded size
+/// cannot be measured. This cache is in-memory only; nothing here is written to
 /// disk.
 private let coverCache: NSCache<NSString, UIImage> = {
     let cache = NSCache<NSString, UIImage>()
@@ -88,6 +96,17 @@ struct GameGridView: View {
     /// control row first.
     @FocusState private var focusedControl: ControlFocus?
 
+    /// Whether any load has finished on this screen yet.
+    ///
+    /// This is what "the very first page of a fresh screen" means, and it is
+    /// deliberately not the same question as "is the grid empty right now".
+    /// Every later load — a Retry after a failed first attempt, a sort change on
+    /// a platform that legitimately has no games — also runs with an empty grid,
+    /// and gating the controls on emptiness would delete the row the user is
+    /// standing on for the length of that request. Once true this never goes
+    /// back to false, so the control row, once it exists, is permanent.
+    @State private var hasSettledOnce = false
+
     private let columns = [GridItem(.adaptive(minimum: 220), spacing: 32)]
 
     init(platform: Platform, client: RommClient) {
@@ -158,6 +177,27 @@ struct GameGridView: View {
         // the user left it, if the pop did not already do that.
         .onAppear { focusPreferredTile(onlyWhenGridUnfocused: true) }
         .onChange(of: focusedRomID) { _, id in model.recordFocusedRom(id: id) }
+        // The first completed load settles the screen for good.
+        //
+        // `isLoading` falling back to false is the event common to all four
+        // outcomes — a committed page, a failure, a cancellation, and a
+        // successful but *empty* page. That last one is why this cannot watch
+        // `items`: a platform with no games publishes no item change and no
+        // error, so an observer on those would never fire and the control row
+        // would stay removable underneath a user who is standing on it.
+        //
+        // The `errorText` half is a backstop for the one outcome the first half
+        // could miss: a load that fails before it ever suspends never renders
+        // `isLoading` as true, so nothing changes on the way back down. The real
+        // client always suspends in `URLSession` first, but a latch that leaves
+        // the screen showing a spinner with no controls if it is ever wrong is
+        // not worth leaving to that.
+        .onChange(of: model.isLoading) { _, isLoading in
+            if !isLoading { hasSettledOnce = true }
+        }
+        .onChange(of: model.errorText) { _, text in
+            if text != nil { hasSettledOnce = true }
+        }
         // Fires exactly when a page commits, which the model only ever does on
         // success — so nothing below reacts to a request that failed or to one
         // that was superseded while in flight.
@@ -166,12 +206,23 @@ struct GameGridView: View {
         }
     }
 
-    /// The controls are hidden only while the very first page of a fresh screen
-    /// is still in flight: there is nothing yet to sort, resize, or page
-    /// through, and leaving them out means the focus engine has nowhere to park
-    /// focus — so the page that lands can take focus without taking it from
-    /// anything. Once a page (or a failure) exists the row stays put.
-    private var showsControls: Bool { !(model.items.isEmpty && model.isLoading) }
+    /// The controls are hidden only until the first load of a fresh screen has
+    /// finished: there is nothing yet to sort, resize, or page through, and
+    /// leaving them out means the focus engine has nowhere to park focus — so
+    /// the page that lands can take focus without taking it from anything. From
+    /// the first settle onward the row is permanent, whatever the grid contains.
+    ///
+    /// `hasSettledOnce` is set by an observer, which runs *after* the body that
+    /// first draws the page it settled on. The `!items.isEmpty` term is what
+    /// keeps the row arriving in the same render pass as that first page
+    /// instead of one pass behind it — which is also the timing the original
+    /// predicate had, so the first-entry focus behaviour is unchanged.
+    ///
+    /// That the row is never torn down once it appears is also what keeps
+    /// `focusedControl` from being left pointing at a view that no longer
+    /// exists, which would arm `focusPreferredTile`'s no-steal guard
+    /// permanently and leave every later page with no focused tile.
+    private var showsControls: Bool { hasSettledOnce || !model.items.isEmpty }
 
     @ViewBuilder
     private var content: some View {
@@ -185,7 +236,11 @@ struct GameGridView: View {
                 .padding(48)
                 controlRow(.bottom)
             }
-        } else if model.isLoading {
+        } else if model.isLoading || !hasSettledOnce {
+            // `!hasSettledOnce` covers the frame between this screen appearing
+            // and its `.task` starting the first load, where the model is idle
+            // with nothing in it. Without it that frame reads "No games on this
+            // page." about a library nobody has asked the server about yet.
             ProgressView("Loading \(platform.name)…")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if model.errorText != nil {
@@ -295,6 +350,14 @@ struct GameGridView: View {
             // the same target rather than advancing twice — and nothing here
             // suggests otherwise, because the page label only ever shows the
             // page that has committed.
+            //
+            // Unstructured on purpose: unlike `.task`, this is not cancelled
+            // when the screen is covered by a pushed `EmulatorScreen`, so a page
+            // requested just before a game is launched still commits behind it.
+            // Pressing Next and then opening a game before the page lands
+            // therefore returns to the new page rather than the one the game was
+            // launched from — the user did press Next, and cancelling their
+            // request because they were quick would be the stranger answer.
             Task { await perform(action) }
         }
         .disabled(!isEnabled(action))
