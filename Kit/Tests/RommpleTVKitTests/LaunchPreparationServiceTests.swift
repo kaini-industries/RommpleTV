@@ -710,8 +710,31 @@ final class LaunchPreparationServiceTests: XCTestCase {
         _ = try await service.prepare(.playStation(game: makeGame(), platformID: 35),
                                       progress: { _ in })
 
+        // Nothing after `.validating`: the store's `.promoting` is the second
+        // half of the same finishing phase, and letting it fall back to `.discs`
+        // made the last frame before a game started read "Discs" with an
+        // indeterminate bar.
         XCTAssertEqual(stages.distinct,
-                       [.checkingCache, .preparingSave, .firmware, .discs, .validating, .discs])
+                       [.checkingCache, .preparingSave, .firmware, .discs, .validating])
+    }
+
+    /// The firmware phase has no promotion of its own, and a `.promoting` that
+    /// somehow arrived there must not be relabelled as the package's validation.
+    func testPromotingOutsideTheDiscPhaseKeepsItsOwnStage() async throws {
+        let stages = StageRecorder()
+        harness.firmwareHandler = { _, _, progress in
+            progress(.downloading(label: "scph5501.bin", completed: 1, total: 2))
+            progress(.promoting)
+            return self.harness.systemDirectory
+        }
+        harness.packageHandler = { _, _ in
+            PreparedDiscSet(entryURL: self.harness.playlistURL, canonicalRomID: 101,
+                            discLabels: [])
+        }
+        let service = makeService(stage: { stages.record($0) })
+        _ = try await service.prepare(.playStation(game: makeGame(), platformID: 35),
+                                      progress: { _ in })
+        XCTAssertEqual(stages.distinct, [.checkingCache, .preparingSave, .firmware, .discs])
     }
 
     /// The firmware manager's own step-1 `.validating` is a BIOS check, not the
@@ -732,12 +755,40 @@ final class LaunchPreparationServiceTests: XCTestCase {
         XCTAssertEqual(stages.distinct, [.checkingCache, .preparingSave, .firmware, .discs])
     }
 
-    func testLegacyReportsOnlyTheCheckingCacheStage() async throws {
+    /// A cartridge transfer says it is transferring.
+    ///
+    /// The screen this route replaced said "Downloading <name> — NN%". Leaving
+    /// the stage on "Checking cache" for the whole of a multi-minute download
+    /// was not a description of what the app was doing, and read as a hang.
+    func testLegacyMovesOffCheckingCacheOnceTheTransferStarts() async throws {
         let stages = StageRecorder()
         let service = makeService(stage: { stages.record($0) })
         _ = try await service.prepare(.legacy(rom: makeRom(), core: legacyCore),
                                       progress: { _ in })
-        XCTAssertEqual(stages.distinct, [.checkingCache])
+        XCTAssertEqual(stages.distinct, [.checkingCache, .downloading])
+    }
+
+    /// What the player actually reads: the stage names the transfer and the
+    /// detail names the file, which is the sentence the deleted screen showed.
+    func testLegacyDownloadHeadlineNamesTheTransferAndTheFile() async throws {
+        harness.legacyDownload = { _, progress in
+            progress(0.5)
+            return self.tmp.appendingPathComponent("rom.sfc")
+        }
+        let snapshots = SnapshotSink()
+        let throttle = LaunchProgressThrottle(interval: 0, now: { 0 },
+                                              publish: { snapshots.record($0) })
+        let service = makeService(stage: { throttle.setStage($0) })
+        _ = try await service.prepare(.legacy(rom: makeRom(sizeBytes: 400), core: legacyCore),
+                                      progress: { throttle.report($0) })
+        throttle.flush()
+
+        guard let last = snapshots.last else { return XCTFail("nothing was published") }
+        XCTAssertEqual(last.headline, "Downloading")
+        XCTAssertNotEqual(last.headline, LaunchStage.checkingCache.title)
+        XCTAssertEqual(last.detail, "Invented Title (USA).sfc")
+        XCTAssertEqual(last.completedBytes, 200)
+        XCTAssertEqual(last.totalBytes, 400)
     }
 }
 
@@ -1260,6 +1311,19 @@ final class LaunchFailurePresenterTests: XCTestCase {
         XCTAssertNotEqual(integrity.recovery, LaunchFailurePresenter.offlineRecovery)
         XCTAssertTrue(integrity.recovery?.contains("scph5501.bin") == true)
         XCTAssertTrue(integrity.recovery?.contains("verified copy") == true)
+    }
+
+    /// Not every `.network` is a connectivity failure. A `badServerResponse` is a
+    /// reachable server behaving badly, and sending that player to check their
+    /// router is the same class of wrong advice as the integrity case.
+    func testAReachableServerFailureDoesNotAdviseCheckingTheNetwork() {
+        let failure = LaunchFailurePresenter.describe(
+            PS1FirmwareError.fetchFailed(fileName: "scph5501.bin",
+                                         reason: .network(.badServerResponse)))
+        XCTAssertNotEqual(failure.recovery, LaunchFailurePresenter.offlineRecovery)
+        XCTAssertTrue(failure.recovery?.contains("RomM server") == true)
+        XCTAssertTrue(failure.recovery?.contains("scph5501.bin") == true)
+        XCTAssertTrue(failure.isRetryable)
     }
 
     func testMissingFirmwareNamesEveryFileTheServerCannotSupply() {

@@ -53,7 +53,19 @@ struct LaunchPreparationView<Ready: View>: View {
         }
         .task { model.run() }
         // Backing out with the Siri Remote's Menu button is the same decision as
-        // pressing Cancel, and has to unwind the same way.
+        // pressing Cancel — but **not the same guarantee**, and the difference is
+        // worth knowing before relying on it. `cancelAndLeave()` awaits the
+        // cleanup and only then dismisses; `onDisappear` cannot await anything,
+        // so this is fire-and-forget and the screen is already gone. Backing out
+        // and immediately launching another PlayStation game can therefore
+        // construct a second `PS1PackageStore` — whose initializer sweeps
+        // `Caches/games/psx` — while the previous attempt is still unwinding.
+        // That is not corrupting: the new attempt's staging directory carries a
+        // fresh UUID and does not exist yet when the sweep runs, and the
+        // cancelled attempt's remaining writes simply fail into the cleanup it
+        // was already performing. It is left as is rather than restructured,
+        // because the alternatives (blocking dismissal, or a shared store that
+        // outlives an attempt) are both worse.
         .onDisappear { Task { await model.cancel() } }
     }
 

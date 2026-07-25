@@ -133,6 +133,10 @@ public struct PreparedDiscSet: Sendable, Equatable {
 /// on its own channel rather than being guessed from label spellings.
 public enum LaunchStage: Sendable, Equatable {
     case checkingCache
+    /// The legacy route's transfer. The PlayStation route has no equivalent
+    /// because its bytes always belong to a named phase — the BIOS or the discs
+    /// — while a cartridge is one file with nothing else to say about it.
+    case downloading
     case preparingSave
     case firmware
     case discs
@@ -141,6 +145,7 @@ public enum LaunchStage: Sendable, Equatable {
     public var title: String {
         switch self {
         case .checkingCache: return "Checking cache"
+        case .downloading: return "Downloading"
         case .preparingSave: return "Preparing save"
         case .firmware: return "BIOS"
         case .discs: return "Discs"
@@ -515,6 +520,17 @@ public enum LaunchFailurePresenter {
             // reason rather than taking the type's own suggestion.
             switch reason {
             case .network:
+                // And not every `.network` is a connectivity failure either — a
+                // `badServerResponse` is a reachable server behaving badly, so
+                // the same rule that classifies an untyped list-stage failure
+                // decides here too.
+                guard isConnectivityFailure(error) else {
+                    return LaunchFailure(
+                        message: message,
+                        recovery: "Check your RomM server, then try again to get "
+                            + "\"\(fileName)\".",
+                        isRetryable: true)
+                }
                 return LaunchFailure(message: message, recovery: offlineRecovery,
                                      isRetryable: true)
             case .integrity:
@@ -560,7 +576,7 @@ public enum LaunchFailurePresenter {
     }
 
     private static func describe(_ error: URLError) -> LaunchFailure {
-        guard PS1PackageStore.isLikelyConnectivityError(error) else {
+        guard isConnectivityFailure(error) else {
             // Deliberately the numeric code and nothing else: `URLError`'s own
             // description embeds the failing URL.
             return LaunchFailure(message: "The transfer failed (network error "
@@ -763,9 +779,17 @@ public actor LaunchPreparationService {
         // which is the honest answer for a download whose size is unknown.
         let total = max(rom.sizeBytes ?? 0, 0)
         let label = rom.fsName
+        let stage = stageSink
         let url: URL
         do {
             url = try await legacy.download(rom) { fraction in
+                // The stage moves off "Checking cache" the moment the first byte
+                // is accounted for. Without this the screen said "Checking
+                // cache" for the whole of a multi-minute cartridge transfer,
+                // which is not a description of what the app is doing and reads
+                // as a hang. A cache hit reports 1.0 once and passes through
+                // here too, which costs one frame nobody sees.
+                stage(.downloading)
                 let clamped = min(max(fraction, 0), 1)
                 progress(.downloading(label: label,
                                       completed: Int64(clamped * Double(total)),
@@ -860,9 +884,16 @@ public actor LaunchPreparationService {
     ) -> @Sendable (PS1PreparationProgress) -> Void {
         let stage = stageSink
         return { value in
-            if case .validating = value, phase == .discs {
-                stage(.validating)
-            } else {
+            // The package store's last two values — its per-disc validation and
+            // then the promotion — are one finishing phase. Mapping only
+            // `.validating` let `.promoting` fall through to `stage(phase)` and
+            // flip the screen *back* to "Discs" with a reset byte pair, so the
+            // last frame before a game started was the opposite of the intended
+            // progression. The firmware manager emits neither of these.
+            switch value {
+            case .validating, .promoting:
+                stage(phase == .discs ? .validating : phase)
+            default:
                 stage(phase)
             }
             downstream(value)
@@ -1010,6 +1041,13 @@ extension PS1Game {
     /// The label is kept as the representative's own, so a player who overrides
     /// `Disc 2` still sees `Disc 2` rather than being told it is disc one of
     /// something.
+    ///
+    /// The canonical id becomes the representative's, which is a *different*
+    /// save identity only when the representative is not disc 1 — override the
+    /// head of a merged set and both spellings name the same id. The override
+    /// still takes effect either way: the disc set changed, so
+    /// `PS1PackageStore.validatePackage` rejects the cached manifest with
+    /// `.discSetChanged` rather than reusing the merged package.
     public var singleDiscOverride: PS1Game {
         let stem = PS1GameClassifier.fileStem(for: representative)
         let label = discs.first { $0.romID == representative.id }?.label ?? "Disc 1"
