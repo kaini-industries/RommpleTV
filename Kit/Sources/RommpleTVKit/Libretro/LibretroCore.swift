@@ -242,11 +242,18 @@ struct DiskController {
         return Int(active.getNumImages())
     }
 
-    /// The disc in the drive, or nil when no interface is registered or no
-    /// disc is inserted — libretro reports the latter as an index at or past
-    /// `get_num_images()`, which is not a disc anything can name.
+    /// The disc in the drive, or nil when no interface is registered, the tray
+    /// is open, or no disc is inserted — libretro reports the last as an index
+    /// at or past `get_num_images()`, which is not a disc anything can name.
+    ///
+    /// The tray is part of the question. `switchDisc` opens it, and its restore
+    /// closing it again is best-effort: a double failure — the insert refused
+    /// *and* the restore's close refused — leaves the tray standing open with
+    /// `get_image_index()` still answering in range. Reporting that index would
+    /// put "Disc 1" on screen over an open drive, which is the same lie as
+    /// naming the disc a failed switch was reaching for.
     var currentIndex: Int? {
-        guard let active else { return nil }
+        guard let active, !active.getEjectState() else { return nil }
         let count = Int(active.getNumImages())
         let index = Int(active.getImageIndex())
         return index < count ? index : nil

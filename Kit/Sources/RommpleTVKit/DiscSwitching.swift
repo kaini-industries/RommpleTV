@@ -77,21 +77,37 @@ public enum DiscSwitchAvailability: Equatable, Sendable {
     /// What to say when there is no switch to offer, or `nil` when there is
     /// nothing to explain.
     ///
-    /// Both sentences name the next action rather than stopping at a diagnosis,
-    /// and the action is one this overlay already has: Quit to Library, then
-    /// launch again. Neither carries a path, a file name or a server.
+    /// Both sentences name a next action **and** say what it means if the action
+    /// changes nothing, because both of these states have two possible causes
+    /// and only one of them is fixable:
+    ///
+    /// - `unsupportedCore` is either a core with no Disk Control at all, which
+    ///   nothing will change, or a core that had not registered its interface
+    ///   yet when this was resolved. `DiscSwitchFlow.reresolve` runs on every
+    ///   pause, so "pause again" is a real remedy for the second and a wasted
+    ///   button press for the first — and the sentence says which is which.
+    /// - `countMismatch` is either a stale or half-installed package, which
+    ///   preparing again fixes, or a core whose `get_num_images()` simply does
+    ///   not agree with the playlist, which preparing again reproduces exactly.
+    ///   A note that stopped at "launch it again" would send a player round a
+    ///   loop that cannot terminate.
+    ///
+    /// Neither carries a path, a file name or a server.
     public var note: String? {
         switch self {
         case .single, .available:
             return nil
         case .unsupportedCore:
-            return "This game has more than one disc, but the emulator core running it can't "
-                + "change discs. You can keep playing this disc."
+            return "This game has more than one disc, but the emulator core running it hasn't "
+                + "offered a way to change them. RommpleTV checks again every time you pause, "
+                + "so resume and pause again if the game was still starting up. If it keeps "
+                + "saying this, this core can't change discs and you can keep playing this one."
         case let .countMismatch(labels, core):
             return "This game was prepared with \(labels) discs and the emulator core loaded "
                 + "\(core), so RommpleTV can't be sure which disc is which. Changing discs is "
                 + "off for this session. Quit to Library and launch this game again to "
-                + "prepare it fresh."
+                + "prepare it fresh. If it says the same thing again, this game's discs can't "
+                + "be changed on this Apple TV."
         }
     }
 
@@ -275,11 +291,48 @@ public final class DiscSwitchFlow: ObservableObject {
     /// current rather than whatever the last attempt left.
     public func refresh() { currentIndex = seams.currentIndex() }
 
+    /// Asks all three questions again, and is called every time the pause
+    /// overlay opens.
+    ///
+    /// Availability was settled at construction, immediately after
+    /// `retro_load_game`, on the assumption that a core registers its Disk
+    /// Control interface during load. Nobody can rule out a core that registers
+    /// later — during its first `retro_run`, say — and with a single resolve at
+    /// construction that assumption failing would be permanent: the state would
+    /// be `unsupportedCore`, the Change Disc button hidden, no picker to open,
+    /// and nothing anywhere that ever looks again. A two-disc game would be
+    /// stuck on disc 1 for the life of the install.
+    ///
+    /// So the same function runs again on every pause, over the same three
+    /// conditions. It is deliberately not a one-way upgrade: the conditions are
+    /// applied to whatever is true now, in both directions, because a core that
+    /// has stopped answering is not a session that should still be offering a
+    /// switch. **It cannot promote a legacy launch**, because the first
+    /// condition is over `labels`, which never changes.
+    ///
+    /// It also clears a stale message: a failure a player cancelled out of
+    /// belongs to the pause it happened in, not to the next one.
+    public func reresolve() {
+        availability = .resolve(labels: labels,
+                                hasDiskControl: seams.hasDiskControl(),
+                                coreDiscCount: seams.discCount())
+        currentIndex = seams.currentIndex()
+        failure = nil
+    }
+
     /// Puts `index` in the drive.
     ///
-    /// Four refusals before the core is asked anything — the state, the index,
-    /// the disc already being in the drive, and frames still running — and then
-    /// one re-query afterwards that happens on **both** paths.
+    /// Five exits, in this order: three refusals that answer `.failed` — the
+    /// state, the index, and frames still running — one `.alreadyInserted` for
+    /// the disc the drive already holds, and the switch itself, whose two
+    /// outcomes share the re-query that follows them.
+    ///
+    /// The frames guard sits above the already-inserted one deliberately. It is
+    /// the only one of the three that is about *this moment* rather than about
+    /// the request, so an unpaused caller must be refused whatever it asked for;
+    /// answering "that disc is already in" to a picker that should not be
+    /// answering at all would report success to a caller that has no business
+    /// being here.
     ///
     /// - Returns: whether the picker may close. `.failed` keeps it open with
     ///   ``failure`` under it.
@@ -290,11 +343,11 @@ public final class DiscSwitchFlow: ObservableObject {
             return refuse(.switchingUnavailable)
         }
         guard labels.indices.contains(index) else { return refuse(.noSuchDisc) }
-        guard !isCurrent(index) else { return .alreadyInserted }
         // The engine refuses this too, and has to: it is the object that owns the
         // display link, so it is the only one that can promise a switch never
         // races a frame. This is the same rule where a test can reach it.
         guard seams.isPaused() else { return refuse(.framesRunning) }
+        guard !isCurrent(index) else { return .alreadyInserted }
 
         var thrown: Error?
         do {
@@ -325,6 +378,16 @@ public final class DiscSwitchFlow: ObservableObject {
     /// `LocalizedError` with sentences written for a player and carrying nothing
     /// about this device; anything else falls back to a fixed sentence rather
     /// than rendering an error whose description could carry a path.
+    ///
+    /// One caveat on the `CoreError` branch: three of that type's cases are not
+    /// about discs at all, and two of them interpolate something this surface
+    /// must never show — `dlopenFailed` a `dlerror()` string and `missingSymbol`
+    /// a symbol name. Neither is reachable here: `switchDisc` is a call on a core
+    /// that has already been constructed and loaded, and the only errors it
+    /// raises are `discControlUnavailable`, `discIndexOutOfRange` and
+    /// `discSwitchFailed`. If a disc path ever gains a case that can throw a
+    /// load-time error, this branch has to become a switch over the three disc
+    /// cases instead.
     private func message(for error: Error) -> String {
         switch error {
         case let core as CoreError: return core.localizedDescription

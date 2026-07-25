@@ -95,8 +95,18 @@ struct EmulatorHostView: View {
                 .onPlayPauseCommand(perform: toggleOverlay)
                 // Every way an overlay opens goes through this, which is why the
                 // note is taken here rather than at each of the three call sites.
+                //
+                // The disc state is asked again here for a different reason: it
+                // was settled once, right after `loadGame`, and a core that
+                // registered its Disk Control interface later than that would
+                // otherwise be stuck reporting no discs for the whole session
+                // with no button, no picker and nothing that ever looks again.
+                // The disc section observes the flow, so a state that changes
+                // here redraws without any further help.
                 .onChange(of: showOverlay) { _, isShowing in
-                    if isShowing { deliverUnwrittenCardNote() }
+                    guard isShowing else { return }
+                    deliverUnwrittenCardNote()
+                    discFlow?.reresolve()
                 }
                 .onChange(of: scenePhase) { _, phase in
                     guard phase != .active else { return }

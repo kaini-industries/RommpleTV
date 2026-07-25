@@ -125,13 +125,40 @@ final class DiscSwitchingTests: XCTestCase {
 
     /// A mismatch is recoverable and says how: the package is rebuilt on the next
     /// launch, and the way to one is already on this overlay.
-    func testTheMismatchStateSaysWhatToDoAboutIt() throws {
+    /// The remedy has to be the one that can work, and it has to say what it
+    /// means when it doesn't.
+    ///
+    /// "Quit and launch again" is right for a stale or half-installed package.
+    /// It is useless for the other cause — a core whose `get_num_images()`
+    /// simply disagrees with the playlist — because preparing again rebuilds the
+    /// same playlist from the same manifest and produces the same two numbers.
+    /// A note that stopped at the first clause would send a player round a loop
+    /// that cannot terminate.
+    func testTheMismatchStateSaysWhatToDoAboutItAndWhatItMeansIfThatChangesNothing() throws {
         let drive = FakeDrive(hasDiskControl: true, discCount: 3, index: 0)
         let flow = makeFlow(drive)
 
         let note = try XCTUnwrap(flow.note)
         XCTAssertTrue(note.contains("Quit"), note)
         XCTAssertTrue(note.contains("again"), note)
+        XCTAssertTrue(note.contains("says the same thing again"),
+                      "the note prescribes a remedy without saying what it means when the "
+                          + "remedy changes nothing: \(note)")
+        XCTAssertTrue(note.contains("can't be changed on this Apple TV"), note)
+    }
+
+    /// The unsupported note used to end at "you can keep playing this disc",
+    /// which is a dead end — and a false one when the core simply had not
+    /// registered its interface yet. Pausing again re-asks, so the note says so.
+    func testTheUnsupportedNoteNamesTheRemedyThatNowExists() throws {
+        let drive = FakeDrive(hasDiskControl: false, discCount: 0, index: nil)
+        let flow = makeFlow(drive)
+
+        let note = try XCTUnwrap(flow.note)
+        XCTAssertTrue(note.contains("pause again"), note)
+        XCTAssertTrue(note.lowercased().contains("keeps saying this"),
+                      "the note offers a remedy without saying what it means when the remedy "
+                          + "changes nothing: \(note)")
     }
 
     func testAgreeingCountsOfferTheSwitch() {
@@ -183,6 +210,20 @@ final class DiscSwitchingTests: XCTestCase {
 
         XCTAssertTrue(drive.requested.isEmpty, "the disc in the drive was ejected and reinserted")
         XCTAssertEqual(flow.currentIndex, 1)
+    }
+
+    /// The frames guard is about *this moment* rather than about the request, so
+    /// it outranks the request being a no-op: a picker that should not be
+    /// answering at all must not be told its choice already happened.
+    func testAnUnpausedPickerIsRefusedEvenForTheDiscAlreadyInTheDrive() {
+        let drive = FakeDrive(index: 1)
+        drive.isPaused = false
+        let flow = makeFlow(drive)
+
+        XCTAssertEqual(flow.select(1), .failed)
+
+        XCTAssertTrue(drive.requested.isEmpty)
+        XCTAssertEqual(flow.failure, DiscSwitchRefusal.framesRunning.localizedDescription)
     }
 
     /// The one rule the core cannot enforce for itself: `LibretroCore` is
@@ -343,6 +384,88 @@ final class DiscSwitchingTests: XCTestCase {
 
         XCTAssertNotNil(flow.failure)
         XCTAssertEqual(flow.failure, DiscSwitchRefusal.noGameRunning.localizedDescription)
+    }
+
+    // MARK: - Asking the three questions again
+
+    /// The worst hardware outcome this design can produce, and the thing that
+    /// stops it being permanent.
+    ///
+    /// Availability is settled right after `retro_load_game`, on the assumption
+    /// that a core registers Disk Control during load. Nobody can rule out a core
+    /// that registers on its first `retro_run` instead — and with one resolve at
+    /// construction, that assumption failing would hide the button, leave no
+    /// picker to open, and never look again: a two-disc game stuck on disc 1 for
+    /// the life of the install.
+    func testAnInterfaceThatRegistersLateIsPickedUpOnTheNextPause() {
+        let drive = FakeDrive(hasDiskControl: false, discCount: 0, index: nil)
+        let flow = makeFlow(drive)
+        XCTAssertEqual(flow.availability, .unsupportedCore)
+        XCTAssertFalse(flow.canSwitch)
+
+        // The core got as far as its first frames and registered.
+        drive.hasDiskControl = true
+        drive.discCount = 2
+        drive.index = 0
+        flow.reresolve()
+
+        XCTAssertEqual(flow.availability, .available(["Disc 1", "Disc 2"]))
+        XCTAssertTrue(flow.canSwitch, "a late registration stayed invisible for the session")
+        XCTAssertEqual(flow.currentDiscLabel, "Disc 1")
+        XCTAssertNil(flow.note)
+        // And it is a working offer, not just a visible one.
+        XCTAssertEqual(flow.select(1), .switched)
+        XCTAssertEqual(drive.requested, [1])
+    }
+
+    /// Re-resolving may not become a back door into the one rule this whole file
+    /// exists for. A Sega CD launch on Genesis Plus GX has a real interface and a
+    /// real disc count at every moment, including this one.
+    func testReresolvingCannotPromoteALegacyLaunch() {
+        let drive = FakeDrive(hasDiskControl: false, discCount: 0, index: nil)
+        let flow = makeFlow(drive, labels: [])
+
+        drive.hasDiskControl = true
+        drive.discCount = 2
+        drive.index = 0
+        flow.reresolve()
+
+        XCTAssertEqual(flow.availability, .single)
+        XCTAssertFalse(flow.showsDiscSection)
+        XCTAssertEqual(flow.select(1), .failed)
+        XCTAssertTrue(drive.requested.isEmpty)
+    }
+
+    /// Not a one-way upgrade: the three conditions are applied to whatever is
+    /// true now. A core that has stopped answering is not a session that should
+    /// still be offering a switch.
+    func testReresolvingFollowsTheCoreDownwardsToo() {
+        let drive = FakeDrive(hasDiskControl: true, discCount: 2, index: 0)
+        let flow = makeFlow(drive)
+        XCTAssertTrue(flow.canSwitch)
+
+        drive.hasDiskControl = false
+        drive.discCount = 0
+        drive.index = nil
+        flow.reresolve()
+
+        XCTAssertEqual(flow.availability, .unsupportedCore)
+        XCTAssertFalse(flow.canSwitch)
+        XCTAssertNil(flow.currentDiscLabel)
+    }
+
+    /// A failure belongs to the pause it happened in. The next pause opens a
+    /// picker that must not have last time's message under it.
+    func testReresolvingClearsAMessageFromAnEarlierPause() {
+        let drive = FakeDrive()
+        drive.refusal = CoreError.discSwitchFailed
+        let flow = makeFlow(drive)
+        XCTAssertEqual(flow.select(1), .failed)
+        XCTAssertNotNil(flow.failure)
+
+        flow.reresolve()
+
+        XCTAssertNil(flow.failure)
     }
 
     // MARK: - Re-reading the drive

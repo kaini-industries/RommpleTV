@@ -1201,6 +1201,23 @@ final class LibretroCoreTests: XCTestCase {
         }
     }
 
+    /// The double failure: the insert is refused *and* the restore's attempt to
+    /// close the tray is refused too. The drive is left standing open with
+    /// `get_image_index()` still answering in range, and reporting that index
+    /// would put "Current disc: Disc 1" on screen over an open drive — the same
+    /// lie as naming the disc the failed switch was reaching for.
+    func testAnOpenTrayHasNoCurrentDisc() throws {
+        let controller = registeredController(imageCount: 3, imageIndex: 0)
+        extendedSpy.refusesToClose = true
+
+        XCTAssertThrowsError(try controller.switchDisc(to: 1))
+
+        XCTAssertTrue(extendedSpy.isEjected, "this test is only about a tray left open")
+        XCTAssertEqual(extendedSpy.imageIndex, 0, "the restore put the prior disc back")
+        XCTAssertNil(controller.currentIndex,
+                     "an open drive reported the disc that happens to be indexed in it")
+    }
+
     func testCurrentDiscIndexIsNilWhenNoDiscIsInserted() throws {
         let controller = registeredController(imageCount: 2, imageIndex: 0)
         XCTAssertEqual(controller.currentIndex, 0)
