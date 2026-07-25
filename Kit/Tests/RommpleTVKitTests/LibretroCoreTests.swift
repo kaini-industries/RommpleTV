@@ -369,15 +369,24 @@ final class LibretroCoreTests: XCTestCase {
         + "/../Cores/macos/genesis_plus_gx_libretro.dylib"
 
     /// Loads one synthetic cartridge through Genesis Plus GX's file route and
-    /// asserts it really ran.
+    /// asserts it really ran *as the right system*.
     ///
-    /// GPGX's memory route (`memcpy` from `info->data`) returns early; the
-    /// file route it takes now opens the file itself and derives the system
-    /// from the *filename*. That hint is why each extension is worth its own
-    /// cartridge rather than one standing in for the rest.
-    private func runSegaCartridge(_ fileName: String, bytes: Data, in dir: URL) throws {
+    /// GPGX's memory route (`memcpy` from `info->data`) returns early; the file
+    /// route it takes now opens the file itself and derives the system from the
+    /// *filename*. The geometry each cartridge produces is therefore the
+    /// evidence that the hint was read correctly, and it has to be asserted per
+    /// cartridge: a bound loose enough for all three would pass a `.gen`
+    /// mis-detected as an 8-bit system.
+    ///
+    /// `frameWidth`/`frameHeight` are the delivered frame, which depends on
+    /// what the cartridge programs. `maxWidth` is the core's per-system
+    /// viewport constant, which nothing the cartridge does can move.
+    private func runSegaCartridge(_ fileName: String, bytes: Data,
+                                  frameWidth: Int, frameHeight: Int, maxWidth: Int,
+                                  in dir: URL) throws {
         let rom = dir.appendingPathComponent(fileName)
         try bytes.write(to: rom, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: rom) }
         let core = try LibretroCore(dylibPath: Self.gpgxCorePath,
                                     systemDirectory: dir, saveDirectory: dir)
         defer { core.unload() }
@@ -396,10 +405,14 @@ final class LibretroCoreTests: XCTestCase {
         XCTAssertNil(core.currentDiscIndex, fileName)
 
         let av = try XCTUnwrap(core.avInfo, fileName)
-        XCTAssertGreaterThanOrEqual(av.baseWidth, 160, fileName)
+        XCTAssertEqual(av.maxWidth, maxWidth,
+                       "\(fileName): wrong system selected from the filename")
         XCTAssertGreaterThan(av.sampleRate, 20_000, fileName)
+
         for _ in 0..<60 { core.runFrame() }
         XCTAssertGreaterThan(sink.frames, 0, "\(fileName): no video frame ever arrived")
+        XCTAssertEqual(sink.lastWidth, frameWidth, "\(fileName): frame width")
+        XCTAssertEqual(sink.lastHeight, frameHeight, "\(fileName): frame height")
         XCTAssertGreaterThan(sink.audioFrameCount, 20_000,
                              "\(fileName): ≈1s of audio in 60 frames")
     }
@@ -407,20 +420,28 @@ final class LibretroCoreTests: XCTestCase {
     func testGenesisPlusGXLoadsFromPathWithNoBytes() throws {
         try skipUnlessCorePresent(Self.gpgxCorePath)
         let dir = try scratchDirectory("rommple-genesis-fullpath")
-        try runSegaCartridge("minimal-cartridge.gen", bytes: Self.minimalGenesisROM(), in: dir)
+        // The cartridge switches the VDP into H40, so 320x224 is also proof
+        // the emulated 68000 ran: a Mega Drive left at its reset viewport
+        // reports 256x192, which is exactly what a Master System reports.
+        try runSegaCartridge("minimal-cartridge.gen", bytes: Self.minimalGenesisROM(),
+                             frameWidth: 320, frameHeight: 224, maxWidth: 348, in: dir)
     }
 
     /// `genesis`, `segacd`, `sms` and `gamegear` all map to this one core
     /// (`PlatformSupport.map`), so honouring `need_fullpath` moved four
     /// accepted platforms onto the file route at once. Master System and Game
-    /// Gear are the ones whose format is decided by the filename.
+    /// Gear are the ones whose format is decided by the filename, and their
+    /// geometries are what tell them apart from each other and from a Mega
+    /// Drive.
     func testGenesisPlusGXLoadsSegaEightBitCartridgesFromPath() throws {
         try skipUnlessCorePresent(Self.gpgxCorePath)
         let dir = try scratchDirectory("rommple-sega8-fullpath")
         try runSegaCartridge("minimal-cartridge.sms",
-                             bytes: Self.minimalSegaEightBitROM(regionAndSize: 0x4C), in: dir)
+                             bytes: Self.minimalSegaEightBitROM(regionAndSize: 0x4C),
+                             frameWidth: 256, frameHeight: 192, maxWidth: 284, in: dir)
         try runSegaCartridge("minimal-cartridge.gg",
-                             bytes: Self.minimalSegaEightBitROM(regionAndSize: 0x6C), in: dir)
+                             bytes: Self.minimalSegaEightBitROM(regionAndSize: 0x6C),
+                             frameWidth: 160, frameHeight: 144, maxWidth: 284, in: dir)
     }
 
     /// A synthetic, copyright-free Master System / Game Gear cartridge: a Z80
@@ -439,7 +460,10 @@ final class LibretroCoreTests: XCTestCase {
     }
 
     /// A synthetic, copyright-free Mega Drive cartridge: vector table, header,
-    /// and a two-byte program that branches to itself.
+    /// and a 68000 program that puts the VDP into 320x224 (H40, display on)
+    /// and then branches to itself. The VDP writes are what make the delivered
+    /// frame Mega-Drive-shaped — a cartridge that only halts leaves the
+    /// viewport at its 256x192 reset state, which a Master System also reports.
     static func minimalGenesisROM(byteCount: Int = 128 * 1024) -> Data {
         var rom = Data(repeating: 0xFF, count: byteCount)
         func write32(_ value: UInt32, at offset: Int) {
@@ -469,8 +493,13 @@ final class LibretroCoreTests: XCTestCase {
         write32(0x00FF_FFFF, at: 0x1AC)                // RAM end
         writeText("", at: 0x1B0, length: 0x40)         // no SRAM, no notes
         writeText("U", at: 0x1F0, length: 16)          // region
-        rom[0x200] = 0x60
-        rom[0x201] = 0xFE                              // BRA.S * — halt in place
+        let program: [UInt8] = [
+            0x33, 0xFC, 0x80, 0x04, 0x00, 0xC0, 0x00, 0x04,   // VDP reg0  = 0x04
+            0x33, 0xFC, 0x81, 0x74, 0x00, 0xC0, 0x00, 0x04,   // VDP reg1  = 0x74
+            0x33, 0xFC, 0x8C, 0x81, 0x00, 0xC0, 0x00, 0x04,   // VDP reg12 = 0x81
+            0x60, 0xFE,                                        // BRA.S *
+        ]
+        rom.replaceSubrange(0x200..<(0x200 + program.count), with: program)
         return rom
     }
 
