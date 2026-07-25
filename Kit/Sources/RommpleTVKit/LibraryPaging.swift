@@ -131,7 +131,7 @@ public final class LibraryPageModel: ObservableObject {
     /// Re-sorting is a new library ordering, so it restarts at page 1.
     /// Re-picking the sort already in use changes nothing and keeps the page.
     public func selectSort(_ sort: RomSort) async {
-        guard sort != self.sort else { return }
+        guard sort != self.sort else { return dismissObsoleteFailure() }
         await load(Target(pageIndex: 0, pageSize: pageSize, sort: sort))
     }
 
@@ -139,8 +139,27 @@ public final class LibraryPageModel: ObservableObject {
     /// size outside `pageSizes` is refused rather than silently coerced, which
     /// would otherwise downgrade a valid preference the user already chose.
     public func selectPageSize(_ size: Int) async {
-        guard Self.pageSizes.contains(size), size != pageSize else { return }
+        guard Self.pageSizes.contains(size), size != pageSize else {
+            return dismissObsoleteFailure()
+        }
         await load(Target(pageIndex: 0, pageSize: size, sort: sort))
+    }
+
+    /// Drops a failure whose target is no longer what the user is asking for.
+    ///
+    /// A sort or size selection that does not move the library is still a user
+    /// action, and it is how someone backs out of a *failed* one: the menus bind
+    /// to the committed `sort`/`pageSize`, which a failed load left untouched, so
+    /// re-picking the visible value is the natural undo. Without this, Retry
+    /// would stay armed with the abandoned target and quietly switch the library
+    /// to the ordering the user just walked away from.
+    ///
+    /// A failure whose target *is* the visible page is not obsolete — retrying it
+    /// reloads exactly what the user is looking at — so it survives.
+    private func dismissObsoleteFailure() {
+        guard let failedTarget, failedTarget != currentTarget else { return }
+        self.failedTarget = nil
+        errorText = nil
     }
 
     /// Remembers the focused tile for the visible page, in memory only.
@@ -229,7 +248,9 @@ public final class LibraryPageModel: ObservableObject {
             errorText = nil
             return
         }
-        if target.sort != sort || target.pageSize != pageSize {
+        let sortChanged = target.sort != sort
+        let pageSizeChanged = target.pageSize != pageSize
+        if sortChanged || pageSizeChanged {
             focusedRomIDsByPage.removeAll()   // a different list is on screen now
         }
         items = page.items
@@ -243,12 +264,21 @@ public final class LibraryPageModel: ObservableObject {
             ? target.pageIndex : nil
         isLoading = false
         errorText = nil
-        persistPreferences()
+        persistPreferences(pageSizeChanged: pageSizeChanged, sortChanged: sortChanged)
     }
 
-    private func persistPreferences() {
-        defaults.set(pageSize, forKey: Self.pageSizeDefaultsKey)
-        defaults.set(sort.rawValue, forKey: Self.sortDefaultsKey(platformID: platformID))
+    /// Writes only what this commit actually changed, still as part of the same
+    /// commit. Page size is a *global* preference, so a model that merely paged
+    /// or refreshed must not rewrite it: several `LibraryPageModel`s can be alive
+    /// at once in a navigation stack, and a stale one refreshing later would
+    /// otherwise clobber the size a newer one just set.
+    private func persistPreferences(pageSizeChanged: Bool, sortChanged: Bool) {
+        if pageSizeChanged {
+            defaults.set(pageSize, forKey: Self.pageSizeDefaultsKey)
+        }
+        if sortChanged {
+            defaults.set(sort.rawValue, forKey: Self.sortDefaultsKey(platformID: platformID))
+        }
     }
 
     private func isCancellation(_ error: Error) -> Bool {

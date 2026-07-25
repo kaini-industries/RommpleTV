@@ -400,6 +400,66 @@ final class LibraryPagingTests: XCTestCase {
                        "retry reissues the failed target; a newer move clears an obsolete one")
     }
 
+    func testNoOpSortOrSizeSelectionClearsAnObsoleteFailure() async {
+        let driver = FetchDriver { request, index in
+            if index == 1 || index == 3 { throw RommError.http(500) }
+            return envelopePage(request, total: 200)
+        }
+        let model = makeModel(driver)
+
+        await model.loadCurrentPage()               // 0: page 1, titleAscending, size 48
+        await model.selectSort(.sizeLargest)        // 1: fails, so `sort` stays titleAscending
+        XCTAssertEqual(model.sort, .titleAscending)
+        XCTAssertNotNil(model.errorText)
+
+        // The sort menu binds to the committed sort, so it still reads
+        // titleAscending: re-picking it is how the user backs out of the failure.
+        await model.selectSort(.titleAscending)
+        XCTAssertNil(model.errorText, "backing out of a failed sort must disarm its Retry")
+
+        await model.retry()                         // 2: the visible page, not sizeLargest
+        let afterSortRetry = await driver.requests
+        XCTAssertEqual(afterSortRetry.last?.sort, .titleAscending,
+                       "Retry must not switch to a sort the user backed away from")
+        XCTAssertEqual(model.sort, .titleAscending)
+
+        await model.selectPageSize(96)              // 3: fails, so `pageSize` stays 48
+        XCTAssertEqual(model.pageSize, 48)
+        XCTAssertNotNil(model.errorText)
+
+        await model.selectPageSize(48)              // the size already in use: a no-op action
+        XCTAssertNil(model.errorText, "backing out of a failed page size must disarm its Retry too")
+        await model.selectPageSize(37)              // a refused size is still a size action
+
+        await model.retry()                         // 4: the visible page at size 48
+        let requests = await driver.requests
+        XCTAssertEqual(requests.map(\.limit), [48, 48, 48, 96, 48],
+                       "Retry must not reissue a page size the user backed away from")
+        XCTAssertEqual(model.pageSize, 48)
+        XCTAssertEqual(model.pageNumber, 1)
+    }
+
+    func testFailureOfTheVisiblePageSurvivesANoOpSelection() async {
+        let driver = FetchDriver { request, index in
+            if index == 1 { throw RommError.http(500) }
+            return envelopePage(request, total: 200)
+        }
+        let model = makeModel(driver)
+
+        await model.loadCurrentPage()               // 0: page 1 visible
+        await model.loadCurrentPage()               // 1: a refresh of that same page fails
+        XCTAssertNotNil(model.errorText)
+
+        await model.selectSort(.titleAscending)     // a no-op, but nothing here is obsolete
+        XCTAssertNotNil(model.errorText,
+                        "a failure whose target is the visible page is still worth retrying")
+
+        await model.retry()                         // 2
+        let requests = await driver.requests
+        XCTAssertEqual(requests.map(\.offset), [0, 0, 0])
+        XCTAssertNil(model.errorText)
+    }
+
     // MARK: Out-of-order completion
 
     func testLateResponseCannotReplaceNewerRequest() async {
@@ -451,6 +511,19 @@ final class LibraryPagingTests: XCTestCase {
         XCTAssertEqual(model.items.map(\.id), Array(1...48))
         XCTAssertEqual(model.pageNumber, 1)
         XCTAssertTrue(model.canGoNext)
+
+        // `URLSession` reports a cancelled request as `URLError.cancelled`, and
+        // `RommClient` propagates it unwrapped, so that is the form the model
+        // actually meets in production.
+        let urlCancelled = Task { await model.goNext() }
+        await driver.waitUntilRequestCount(3)
+        await driver.resume(2, throwing: URLError(.cancelled))
+        await urlCancelled.value
+
+        XCTAssertFalse(model.isLoading)
+        XCTAssertNil(model.errorText, "a cancelled URL request is not a failure either")
+        XCTAssertEqual(model.items.map(\.id), Array(1...48))
+        XCTAssertEqual(model.pageNumber, 1)
     }
 
     func testObsoleteCancellationCannotClearNewerLoading() async {
@@ -558,6 +631,7 @@ final class LibraryPagingTests: XCTestCase {
         await model.loadCurrentPage()
         await model.selectPageSize(96)
         await model.selectSort(.dateAddedNewest)
+        model.recordFocusedRom(id: 5)     // a tile on page 1, which page 1 still holds
         await model.goNext()
         model.recordFocusedRom(id: 101)
         XCTAssertEqual(model.pageNumber, 2)
@@ -571,7 +645,10 @@ final class LibraryPagingTests: XCTestCase {
         XCTAssertEqual(relaunched.pageSize, 96)
         XCTAssertEqual(relaunched.sort, .dateAddedNewest)
         XCTAssertEqual(relaunched.pageNumber, 1)
-        XCTAssertNil(relaunched.preferredFocusedRomID)
+        await relaunched.loadCurrentPage()
+        XCTAssertEqual(relaunched.items.map(\.id), Array(1...96))
+        XCTAssertNil(relaunched.preferredFocusedRomID,
+                     "rom 5 is on the restored page, so a persisted focus would surface here")
 
         // A different platform shares the global page size but keeps its own sort.
         let otherPlatform = makeModel(driver, platformID: 8, defaults: defaults)
@@ -584,6 +661,26 @@ final class LibraryPagingTests: XCTestCase {
         await failing.selectPageSize(24)
         XCTAssertEqual(defaults.integer(forKey: "library.pageSize"), 96,
                        "preferences are committed only with a successful page")
+    }
+
+    func testRefreshDoesNotRewriteGlobalPageSizeSetByAnotherModel() async {
+        let defaults = isolatedDefaults()
+        let driver = FetchDriver { request, _ in envelopePage(request, total: 200) }
+
+        // Two platforms' models alive at once, as a navigation stack would keep them.
+        let stale = makeModel(driver, platformID: 7, defaults: defaults)
+        await stale.loadCurrentPage()
+        XCTAssertEqual(stale.pageSize, 48)
+
+        let newer = makeModel(driver, platformID: 8, defaults: defaults)
+        await newer.loadCurrentPage()
+        await newer.selectPageSize(96)
+        XCTAssertEqual(defaults.integer(forKey: "library.pageSize"), 96)
+
+        await stale.loadCurrentPage()   // a refresh, not a size action
+        XCTAssertEqual(defaults.integer(forKey: "library.pageSize"), 96,
+                       "paging or refreshing must not clobber a global size another model just set")
+        XCTAssertEqual(stale.pageSize, 48, "the stale model keeps showing what it loaded")
     }
 
     // MARK: Shrunken library
