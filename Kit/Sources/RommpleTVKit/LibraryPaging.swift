@@ -184,6 +184,10 @@ public final class LibraryPageModel: ObservableObject {
         let stamp = generation
         var target = requested
         isLoading = true
+        // Cleared here, at issue, and not in the commit paths: the app's only
+        // Retry button lives in the error row, so this is what removes it
+        // before a second press can reach a `retry()` that has already taken
+        // its target. Pinned by `testErrorClearsWhenTheRetryRequestIsIssued…`.
         errorText = nil
         // Any newly issued load makes an earlier failure obsolete; `retry()` has
         // already taken the target it wants above.

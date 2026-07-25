@@ -115,6 +115,15 @@ public struct RomPage: Sendable {
     public let total: Int?
     public let limit: Int
     public let offset: Int
+
+    /// Public so callers outside the module — an App-layer test double, a
+    /// SwiftUI preview — can build a page without reaching the network.
+    public init(items: [Rom], total: Int?, limit: Int, offset: Int) {
+        self.items = items
+        self.total = total
+        self.limit = limit
+        self.offset = offset
+    }
 }
 
 struct RomsPage: Decodable {   // handles both envelope and bare-array shapes

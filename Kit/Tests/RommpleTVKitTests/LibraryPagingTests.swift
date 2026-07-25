@@ -27,7 +27,7 @@ private actor FetchDriver {
         let continuation: CheckedContinuation<Void, Never>
     }
 
-    private var responder: Responder?
+    private let responder: Responder?
     private var recorded: [Request] = []
     private var suspended: [Int: CheckedContinuation<RomPage, Error>] = [:]
     private var cancelledIndices: Set<Int> = []
@@ -37,9 +37,6 @@ private actor FetchDriver {
 
     var requests: [Request] { recorded }
     var requestCount: Int { recorded.count }
-
-    /// Switches modes mid-test. Passing `nil` suspends every subsequent request.
-    func setResponder(_ responder: Responder?) { self.responder = responder }
 
     nonisolated func fetch() -> LibraryPageModel.Fetch {
         { limit, offset, sort in
@@ -458,6 +455,50 @@ final class LibraryPagingTests: XCTestCase {
         let requests = await driver.requests
         XCTAssertEqual(requests.map(\.offset), [0, 0, 0])
         XCTAssertNil(model.errorText)
+    }
+
+    /// `load()` clears `errorText` when the request is *issued* — before its
+    /// first `await` — and the app's Retry design rests on exactly that: the
+    /// error row carries the only Retry button in the view, so clearing the
+    /// error at issue removes the button before a second press is possible.
+    /// That matters because `retry()` takes `failedTarget` and then clears it,
+    /// so a second press mid-flight would reload the visible page instead of
+    /// the page that failed.
+    ///
+    /// Every other `errorText` assertion in this file is made after a load has
+    /// finished, where `publish()` and `finishCancelled()` also clear it, so
+    /// they would all stay green if the clear were moved into the commit paths.
+    /// This is the only test that observes the value while a request is still
+    /// in flight, and so the only one that pins the invariant.
+    func testErrorClearsWhenTheRetryRequestIsIssuedNotWhenItCompletes() async {
+        let driver = FetchDriver()   // every request suspends until this test answers it
+        let model = makeModel(driver)
+        await primeFirstPage(model, driver)     // 0: page 1 visible
+
+        let failing = Task { await model.goNext() }
+        await driver.waitUntilRequestCount(2)   // 1: page 2, about to fail
+        await driver.resume(1, throwing: RommError.http(503))
+        await failing.value
+        XCTAssertNotNil(model.errorText, "the failed page must arm Retry")
+        XCTAssertFalse(model.isLoading)
+
+        // 2: Retry, held inside the fetch so the model is observable mid-flight.
+        let retrying = Task { await model.retry() }
+        await driver.waitUntilRequestCount(3)
+
+        XCTAssertNil(model.errorText,
+                     "the error must be cleared at issue, so the only Retry button is gone "
+                     + "before a second press can reach a model that has already taken its target")
+        XCTAssertTrue(model.isLoading, "the in-flight retry must own the spinner")
+
+        await driver.resume(2, with: RomPage(items: fixtureRoms(48, firstID: 49),
+                                             total: 200, limit: 48, offset: 48))
+        await retrying.value
+
+        XCTAssertEqual(model.pageNumber, 2, "Retry reissued the page that failed")
+        XCTAssertEqual(model.items.map(\.id), Array(49...96))
+        XCTAssertNil(model.errorText)
+        XCTAssertFalse(model.isLoading)
     }
 
     // MARK: Out-of-order completion
