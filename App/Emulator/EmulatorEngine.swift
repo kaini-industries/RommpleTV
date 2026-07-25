@@ -17,9 +17,9 @@ final class EmulatorEngine: NSObject, CoreAVSink {
     // with the real core's fps/sampleRate once `loadGame` reports `avInfo`.
     private var pacer = AudioPacer.standard(sampleRate: 44100, fps: 60)
 
-    // Battery-save (SRAM) lifecycle.
-    private var saveStore: BatterySaveStore?
-    private var romID: Int?
+    // Battery-save (SRAM) lifecycle. The store and the ROM id that owns the save
+    // both arrive on `PreparedLaunch`; the engine chooses neither.
+    private var launch: PreparedLaunch?
     private var lastFlushedSRAM: Data?
     private var ticksSinceFlush = 0
     private static let flushIntervalTicks = 600   // ~10s at 60Hz
@@ -51,34 +51,41 @@ final class EmulatorEngine: NSObject, CoreAVSink {
 
     init(renderer: MetalRenderer) { self.renderer = renderer }
 
-    func start(romURL: URL, coreName: String, romID: Int) throws {
+    /// Starts the game a `LaunchPreparationService` prepared.
+    ///
+    /// Every path this used to compute now arrives on the value. That matters
+    /// for more than tidiness: the system directory used to be a fixed
+    /// `Caches/system` regardless of platform, which is the wrong directory for
+    /// PlayStation — Beetle PSX reads its BIOS from the one
+    /// `PS1FirmwareManager` owns and installs into, and a core pointed at an
+    /// empty system directory boots to a black screen with no error.
+    func start(_ launch: PreparedLaunch) throws {
+        let coreName = launch.core.coreName
         guard let fwPath = Bundle.main.privateFrameworksPath,
               FileManager.default.fileExists(atPath: "\(fwPath)/\(coreName).dylib")
         else { throw EngineError.coreNotBundled(coreName) }
 
-        // tvOS sandbox: only Caches and tmp are writable. snes9x needs no BIOS,
-        // and battery saves are persisted separately, so cache volatility is fine.
-        let support = FileManager.default.urls(for: .cachesDirectory,
-                                               in: .userDomainMask)[0]
-        let systemDir = support.appendingPathComponent("system", isDirectory: true)
-        let saveDir = support.appendingPathComponent("saves", isDirectory: true)
-        try FileManager.default.createDirectory(at: systemDir, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: saveDir, withIntermediateDirectories: true)
+        // Both are inside Caches, which with tmp is all a tvOS app may write to.
+        // Creating them here is idempotent: the firmware manager has already
+        // created its own, and a legacy launch has nothing to create them.
+        try FileManager.default.createDirectory(at: launch.systemDirectory,
+                                                withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: launch.saveDirectory,
+                                                withIntermediateDirectories: true)
 
         let core = try LibretroCore(dylibPath: "\(fwPath)/\(coreName).dylib",
-                                    systemDirectory: systemDir, saveDirectory: saveDir)
+                                    systemDirectory: launch.systemDirectory,
+                                    saveDirectory: launch.saveDirectory)
         core.sink = self
 
-        // Same Caches root the core's own system/save dirs live under.
-        let saveStore = BatterySaveStore(cachesRoot: support)
         let restored: Data?
         do {
-            try core.loadGame(at: romURL)
+            try core.loadGame(at: launch.entryURL)
             // A read failure is propagated rather than swallowed: treating an
             // unreadable save as a missing one starts the game on a blank
             // battery and the next flush writes that blank over the real one.
             // Task 11 turns this into a message a player can act on.
-            restored = try saveStore.load(romID: romID)
+            restored = try launch.saveStore.load(romID: launch.canonicalRomID)
         } catch {
             // A constructed core owns the process-wide gCore slot; failing to
             // start must release it or no game can ever start until relaunch.
@@ -86,8 +93,7 @@ final class EmulatorEngine: NSObject, CoreAVSink {
             throw error
         }
         self.core = core
-        self.romID = romID
-        self.saveStore = saveStore
+        self.launch = launch
         if let restored {
             core.restoreRAM(restored)
             // Freshly restored data already matches disk — don't re-flush it
@@ -182,11 +188,18 @@ final class EmulatorEngine: NSObject, CoreAVSink {
     /// flush would see "nothing changed" and skip the retry — one failed write
     /// would silently become a lost save.
     private func flushSRAMIfNeeded() {
-        guard let core, let saveStore, let romID, let sram = core.saveRAM() else { return }
+        guard let core, let launch, let sram = core.saveRAM() else { return }
         if let last = lastFlushedSRAM, last == sram { return }
         do {
-            try saveStore.save(sram, romID: romID)
+            try launch.saveStore.save(sram, romID: launch.canonicalRomID)
             lastFlushedSRAM = sram
+            // `launch.onLocalSave` is deliberately NOT called here. It schedules
+            // the upload of a PlayStation memory card, and its binding
+            // precondition is that the local write above has already succeeded —
+            // which it has — but wiring the remote half of the save session is
+            // Task 11's, along with the failure surface a player sees when this
+            // write throws. Calling it now would put an unobserved upload path
+            // into a build whose save-failure UI does not exist yet.
         } catch {
             // Keep the dirty value so the next flush tries again. Task 11 adds
             // the user-visible failure.

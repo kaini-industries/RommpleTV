@@ -1,11 +1,17 @@
 import SwiftUI
 import MetalKit
 import GameController
+import RommpleTVKit
 
+/// The running game.
+///
+/// Initialized from a `PreparedLaunch` and nothing else. It never infers a
+/// sibling, refetches a platform, or knows where a package lives: which file to
+/// load, which core to load it with, which directories the core may write to and
+/// which ROM id owns the save were all decided by `LaunchPreparationService`
+/// before this view existed.
 struct EmulatorHostView: View {
-    let romURL: URL
-    let coreName: String
-    let romID: Int
+    let launch: PreparedLaunch
     @Environment(\.dismiss) private var dismiss
     @State private var errorText: String?
     @State private var showOverlay = false
@@ -20,7 +26,7 @@ struct EmulatorHostView: View {
                 }
             } else {
                 ZStack {
-                    MetalHostRepresentable(romURL: romURL, coreName: coreName, romID: romID,
+                    MetalHostRepresentable(launch: launch,
                                            errorText: $errorText,
                                            showOverlay: showOverlay,
                                            onEngineReady: { engine = $0 },
@@ -77,9 +83,7 @@ private final class EmulatorHostController: GCEventViewController {
 }
 
 private struct MetalHostRepresentable: UIViewControllerRepresentable {
-    let romURL: URL
-    let coreName: String
-    let romID: Int
+    let launch: PreparedLaunch
     @Binding var errorText: String?
     // When true, the SwiftUI pause overlay is on screen. controllerUserInteractionEnabled
     // suppresses ALL pad-driven UIKit focus-engine translation while this
@@ -114,7 +118,7 @@ private struct MetalHostRepresentable: UIViewControllerRepresentable {
         engine.onOverlayRequested = onOverlayRequested
         engine.onPauseRequested = onPauseRequested
         do {
-            try engine.start(romURL: romURL, coreName: coreName, romID: romID)
+            try engine.start(launch)
             // Drive draws at 60 too — after the core ran, present its frame.
             let link = CADisplayLink(target: view, selector: #selector(MTKView.draw as (MTKView) -> () -> Void))
             link.add(to: .main, forMode: .common)

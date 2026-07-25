@@ -266,7 +266,7 @@ struct GameGridView: View {
 
     private func card(for rom: Rom) -> some View {
         NavigationLink {
-            EmulatorScreen(rom: rom, platformSlug: platform.slug, client: client)
+            launchScreen(for: rom)
         } label: {
             VStack {
                 CoverImage(rom: rom, client: client)
@@ -278,6 +278,44 @@ struct GameGridView: View {
         .buttonStyle(.card)
         .disabled(!PlatformSupport.isPlayable(slug: platform.slug))
         .focused($focusedRomID, equals: rom.id)
+    }
+
+    /// The one place a card becomes a launch.
+    ///
+    /// This is the whole of the view layer's involvement in what happens next:
+    /// which of the two requests to build, and the game's own title. It assembles
+    /// no URL, no package path and no save identity — `LaunchPreparationModel`
+    /// is handed the request and the client and owns everything after that.
+    @ViewBuilder
+    private func launchScreen(for rom: Rom) -> some View {
+        let title = rom.name ?? rom.fsName
+        if PlatformSupport.isPlayStation(slug: platform.slug) {
+            // The classifier decides which of this metadata group's entries are
+            // genuinely discs of one game; the runtime platform id is what the
+            // BIOS list is fetched for. Neither is guessed here.
+            LaunchPreparationView(
+                model: LaunchPreparationModel(
+                    request: .playStation(game: PS1GameClassifier.classify(rom),
+                                          platformID: platform.id),
+                    client: client),
+                title: title
+            ) { EmulatorHostView(launch: $0) }
+        } else if let core = PlatformSupport.core(forSlug: platform.slug) {
+            LaunchPreparationView(
+                model: LaunchPreparationModel(request: .legacy(rom: rom, core: core),
+                                              client: client),
+                title: title
+            ) { EmulatorHostView(launch: $0) }
+        } else {
+            // Unreachable while the card above is disabled for an unplayable
+            // platform, and kept as the second half of that defence rather than
+            // as a `!` that would crash instead.
+            VStack(spacing: 12) {
+                Text("Not playable on Apple TV").font(.title3)
+                Text("\(platform.slug) has no embedded core (see the spec's platform notes).")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
     }
 
     // MARK: - Controls
