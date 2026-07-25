@@ -156,6 +156,53 @@ final class LibretroCoreTests: XCTestCase {
         XCTAssertGreaterThan(sink.audioFrameCount, 32000, "≈1s+ of audio in 2s of frames")
     }
 
+    /// The button ids are libretro's, checked against libretro's own header
+    /// rather than against numbers copied into a test.
+    ///
+    /// Two separate claims. The raw values are the wire format
+    /// `retro_input_state_t` is called with, so a renumbered case is a remapped
+    /// button — and the set has to be *complete*, because a core polls whatever
+    /// its device type has and reads a missing id as "not pressed" forever. That
+    /// is what L2/R2 were on PlayStation: `retro_set_controller_port_device(0,
+    /// RETRO_DEVICE_JOYPAD)` names a PlayStation Controller, Beetle PSX polls ids
+    /// 12-15 every frame, and there was nothing to answer with.
+    func testRetroButtonsAreLibretroJoypadIDs() {
+        XCTAssertEqual(RetroButton.b.rawValue, RETRO_DEVICE_ID_JOYPAD_B)
+        XCTAssertEqual(RetroButton.y.rawValue, RETRO_DEVICE_ID_JOYPAD_Y)
+        XCTAssertEqual(RetroButton.select.rawValue, RETRO_DEVICE_ID_JOYPAD_SELECT)
+        XCTAssertEqual(RetroButton.start.rawValue, RETRO_DEVICE_ID_JOYPAD_START)
+        XCTAssertEqual(RetroButton.up.rawValue, RETRO_DEVICE_ID_JOYPAD_UP)
+        XCTAssertEqual(RetroButton.down.rawValue, RETRO_DEVICE_ID_JOYPAD_DOWN)
+        XCTAssertEqual(RetroButton.left.rawValue, RETRO_DEVICE_ID_JOYPAD_LEFT)
+        XCTAssertEqual(RetroButton.right.rawValue, RETRO_DEVICE_ID_JOYPAD_RIGHT)
+        XCTAssertEqual(RetroButton.a.rawValue, RETRO_DEVICE_ID_JOYPAD_A)
+        XCTAssertEqual(RetroButton.x.rawValue, RETRO_DEVICE_ID_JOYPAD_X)
+        XCTAssertEqual(RetroButton.l.rawValue, RETRO_DEVICE_ID_JOYPAD_L)
+        XCTAssertEqual(RetroButton.r.rawValue, RETRO_DEVICE_ID_JOYPAD_R)
+        XCTAssertEqual(RetroButton.l2.rawValue, RETRO_DEVICE_ID_JOYPAD_L2)
+        XCTAssertEqual(RetroButton.r2.rawValue, RETRO_DEVICE_ID_JOYPAD_R2)
+        XCTAssertEqual(RetroButton.l3.rawValue, RETRO_DEVICE_ID_JOYPAD_L3)
+        XCTAssertEqual(RetroButton.r3.rawValue, RETRO_DEVICE_ID_JOYPAD_R3)
+        XCTAssertEqual(RetroButton.allCases.map(\.rawValue).sorted(), Array(Int32(0)..<16),
+                       "every joypad id 0-15 must have a case: an id with none "
+                       + "reads 0 for the life of the install")
+    }
+
+    /// Every case is a legal index into the core's input array.
+    ///
+    /// No game and no fixture needed — `setButton` only writes the array — which
+    /// is the point: this is the test that would have caught adding L2/R2/L3/R3
+    /// without the array being wide enough, and an out-of-range id traps rather
+    /// than misbehaving quietly.
+    func testEveryButtonIndexesTheCoreInputArray() throws {
+        let core = try makeCore()
+        defer { core.unload() }
+        for button in RetroButton.allCases {
+            core.setButton(button, pressed: true)
+            core.setButton(button, pressed: false)
+        }
+    }
+
     func testInputAndSecondLoadDoNotCrash() throws {
         let rom = try romURL()
         let core = try makeCore()

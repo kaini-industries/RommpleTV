@@ -53,6 +53,26 @@ final class ControllerInput {
         disconnectHandler = handler
     }
 
+    /// How far a trigger travels before the core is told the button is down, and
+    /// how far back before it is told it is up.
+    ///
+    /// A PlayStation Controller's L2/R2 are digital microswitches — there is no
+    /// half-press to forward — while every pad tvOS supports reports its triggers
+    /// as an analogue axis, so the conversion has to happen somewhere and where
+    /// it happens is felt rather than incidental. 0.25 registers early in the
+    /// travel, which is what a player cycling weapons or paging a menu expects,
+    /// and sits well clear of the small non-zero value a slack trigger can rest
+    /// at on a third-party pad.
+    ///
+    /// The two numbers are deliberately different. On a single threshold, a
+    /// trigger held right at it flips the button on and off with the noise and
+    /// the core reads a burst of taps; nothing can cross a 0.10 deadband by
+    /// jitter. `pressedChangedHandler` is not used here for the same reason —
+    /// what it calls "pressed" is the framework's own analogue-travel decision,
+    /// which this layer has no say over and cannot give a deadband to.
+    private static let triggerPress: Float = 0.25
+    private static let triggerRelease: Float = 0.15
+
     private func mapAll() {
         for controller in GCController.controllers() {
             guard let pad = controller.extendedGamepad else { continue }
@@ -76,6 +96,31 @@ final class ControllerInput {
             pad.rightShoulder.pressedChangedHandler = { _, _, p in send(.r, p) }
             pad.buttonMenu.pressedChangedHandler = { _, _, p in send(.start, p) }
             pad.buttonOptions?.pressedChangedHandler = { _, _, p in send(.select, p) }
+            // L2/R2. Analogue on the pad, digital to the core — see
+            // `triggerPress` for where the line is drawn and why there are two of
+            // them. `isDown` is per-binding state and is the deadband: without a
+            // memory of which side the trigger was last on, there is nothing to
+            // be hysteretic about.
+            func bindTrigger(_ input: GCControllerButtonInput, to button: RetroButton) {
+                // Seeded from where the trigger actually is, not from `false`.
+                // `mapAll` runs again whenever any pad connects, so a rebind can
+                // land mid-hold — and a binding that assumed "up" would answer
+                // the release with "no change" and leave the core holding a
+                // button nothing will ever lift.
+                var isDown = input.value >= Self.triggerPress
+                input.valueChangedHandler = { _, value, _ in
+                    let down = isDown ? value > Self.triggerRelease
+                                      : value >= Self.triggerPress
+                    guard down != isDown else { return }
+                    isDown = down
+                    send(button, down)
+                }
+            }
+            bindTrigger(pad.leftTrigger, to: .l2)
+            bindTrigger(pad.rightTrigger, to: .r2)
+            // R3 (right stick click). L3 is not sent to the core — see the
+            // overlay binding at the end of this function.
+            pad.rightThumbstickButton?.pressedChangedHandler = { _, _, p in send(.r3, p) }
             pad.dpad.valueChangedHandler = { _, x, y in
                 send(.left, x < -0.5); send(.right, x > 0.5)
                 send(.down, y < -0.5); send(.up, y > 0.5)
@@ -84,9 +129,17 @@ final class ControllerInput {
                 send(.left, x < -0.5); send(.right, x > 0.5)
                 send(.down, y < -0.5); send(.up, y > 0.5)
             }
-            // Left-stick click opens/closes the pause overlay. buttonOptions
-            // stays mapped to SNES Select above — this is the pad's only
-            // spare input for the overlay trigger.
+            // Left-stick click opens/closes the pause overlay, so L3 is the one
+            // libretro id this pad never sends. With L2/R2/R3 now mapped there
+            // is no spare input left: every other control is a game button, and
+            // the pad needs *some* way to reach the overlay, which is where the
+            // save failure, Retry Save, Change Disc and Quit all live — a game
+            // that cannot be paused is a game whose card cannot be written on
+            // purpose. Keeping the overlay on L3 rather than moving it to R3
+            // also leaves the seven hardware-accepted systems' pause gesture
+            // exactly where players already have it; either way one stick click
+            // is spent, and this is the one PlayStation asks for least.
+            // buttonOptions stays mapped to Select above.
             pad.leftThumbstickButton?.pressedChangedHandler = { [weak self] _, _, pressed in
                 if pressed { self?.overlayHandler?() }
             }

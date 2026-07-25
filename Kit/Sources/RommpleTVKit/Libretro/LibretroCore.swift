@@ -18,9 +18,23 @@ public protocol CoreAVSink: AnyObject {
     func audioFrames(_ samples: UnsafePointer<Int16>, frameCount: Int)
 }
 
+/// libretro's `RETRO_DEVICE_ID_JOYPAD_*` ids.
+///
+/// The raw values are the wire format `retro_input_state_t` is called with, not
+/// an ordering choice: `id` arrives from the core and indexes `buttons`
+/// directly, so renumbering a case silently remaps a button.
+///
+/// All sixteen ids, including the four no cartridge system this app ships has
+/// any use for. `retro_set_controller_port_device(0, RETRO_DEVICE_JOYPAD)` tells
+/// Beetle PSX it is talking to a PlayStation Controller, so it polls ids 12-15
+/// every frame whatever the frontend does about them — and an id with no case
+/// is a button that reads 0 for the life of the install, with no error anywhere
+/// and no test that can press it. A large part of the PlayStation library puts
+/// camera control, weapon cycling and menu paging on L2/R2.
 public enum RetroButton: Int32, CaseIterable, Sendable {
     case b = 0, y = 1, select = 2, start = 3, up = 4, down = 5, left = 6,
-         right = 7, a = 8, x = 9, l = 10, r = 11
+         right = 7, a = 8, x = 9, l = 10, r = 11, l2 = 12, r2 = 13,
+         l3 = 14, r3 = 15
 }
 
 public enum CoreError: Error {
