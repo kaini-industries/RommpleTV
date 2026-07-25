@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 // MARK: - Public surface
@@ -319,8 +320,10 @@ public actor PS1PackageStore {
         self.isConnectivityError = isConnectivityError
 
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        // Order matters: a backup is a package waiting to be restored, and the
-        // sweep below must never be able to see one.
+        // Repair first as a matter of intent rather than necessity: the sweep
+        // matches `stagingPrefix` and a backup carries `backupPrefix`, so the two
+        // cannot collide today. Restoring a package before reclaiming space is
+        // still the order to write down.
         Self.repairInterruptedPromotions(in: root)
         Self.removeAbandonedStaging(in: root)
     }
@@ -356,6 +359,10 @@ public actor PS1PackageStore {
 
         // Step 1 — is what is already on disk still a package?
         let cached = try? Self.validatePackage(at: canonical, for: game).get()
+        // Step 1 can stream-hash a whole disc. `sha1OfFile` stops between chunks
+        // when the task is cancelled and reports the file as unverifiable, so this
+        // check has to come before that answer is mistaken for a stale package.
+        try Task.checkCancellation()
 
         // Step 2 — refresh metadata for every disc.
         let details: [RomDetails]
@@ -555,6 +562,16 @@ public actor PS1PackageStore {
     /// initialization moves it back. If the process dies during either rename,
     /// `rename(2)` is atomic and the directory is wholly at one path or the other.
     /// The backup is removed only after the new package is in place.
+    ///
+    /// - Important: **This function must never become `async`, and no `await` may
+    ///   appear between the staged-cue re-parse and the second rename below.** The
+    ///   actor yields at every suspension point, so a suspension anywhere in this
+    ///   sequence lets a second `prepare` for the same game interleave against one
+    ///   canonical path — one promotion's backup rename landing between another's
+    ///   backup and install. That two concurrent preparations cannot damage a
+    ///   package is a consequence of this function being synchronous, not of the
+    ///   actor; `testConcurrentPreparesForOneGameLeaveOneValidPackage` covers the
+    ///   behaviour but no test can catch the day someone adds an `await` here.
     private func promote(staging: URL, to canonical: URL, canonicalRomID: Int) throws {
         let manager = FileManager.default
         try promotionProbe?(.beforeBackup)
@@ -596,7 +613,8 @@ public actor PS1PackageStore {
         where name.hasPrefix(backupPrefix) {
             let backup = root.appendingPathComponent(name, isDirectory: true)
             guard let romID = canonicalID(inBackupName: name) else {
-                try? manager.removeItem(at: backup)
+                // Left alone on purpose. A backup this code cannot place is still a
+                // whole package; it costs space, and deleting it costs the package.
                 continue
             }
             let canonical = root.appendingPathComponent(String(romID), isDirectory: true)
@@ -678,8 +696,13 @@ public actor PS1PackageStore {
                                                       names: cues.map(\.fileName).sorted())
         }
         guard let cue = cues.first else {
-            throw PS1PackageError.unsupportedLaunchFile(
-                label: disc.label, fileName: topLevel.map(\.fileName).sorted()[0])
+            // Name the largest top-level file. RomM marks *every* row of a ROM
+            // top-level in the sampled library, so "the first one alphabetically"
+            // would routinely name a `.bin` sidecar in a sentence that goes on to
+            // say bin files are supported. The disc image is the big one.
+            let named = topLevel.sorted { ($0.sizeBytes, $1.fileName) > ($1.sizeBytes, $0.fileName) }
+            throw PS1PackageError.unsupportedLaunchFile(label: disc.label,
+                                                        fileName: named[0].fileName)
         }
         // A cue sheet is a few kilobytes. Refusing an absurd declared size here is
         // cheaper than discovering it after transferring the bytes, and
@@ -1093,18 +1116,47 @@ public actor PS1PackageStore {
         (try? FileManager.default.attributesOfItem(atPath: url.path))?[.type] as? FileAttributeType
     }
 
-    /// Streams the file past a digest; never holds more than one chunk.
+    /// Streams the file past a SHA-1; never holds more than one chunk.
+    ///
+    /// SHA-1 alone rather than `IncrementalFileDigest`, which computes MD5 and
+    /// CRC-32 in the same pass and would have two thirds of its work discarded
+    /// here. Re-reading a touched 480 MB disc is already the most expensive thing
+    /// step 1 can do on an Apple TV. `testStreamingSHA1AgreesWithTheFullDigest`
+    /// pins the two against each other so the second formatter cannot drift.
+    ///
+    /// Returns `nil` when the task is cancelled, which reads as "this file could
+    /// not be verified" — the caller invalidates, and the cancellation check
+    /// immediately after step 1 throws before that answer can be acted on.
     static func sha1OfFile(at url: URL) -> String? {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
-        var digest = IncrementalFileDigest()
+        var sha1 = Insecure.SHA1()
         while true {
+            // Between chunks, which is the only place a multi-second hash of a
+            // whole disc can be stopped.
+            if Task.isCancelled { return nil }
             let chunk: Data?
             do { chunk = try handle.read(upToCount: 1 << 16) } catch { return nil }
             guard let chunk, !chunk.isEmpty else { break }
-            digest.update(chunk)
+            sha1.update(data: chunk)
         }
-        return digest.finalized().sha1
+        return hexadecimal(sha1.finalize())
+    }
+
+    private static let hexDigits = Array("0123456789abcdef".utf8)
+
+    /// Lowercase, two characters per byte, no leading zero suppression — the same
+    /// spelling `IncrementalFileDigest` produces, because these two strings are
+    /// compared against each other.
+    static func hexadecimal<Bytes: Sequence>(_ bytes: Bytes) -> String
+    where Bytes.Element == UInt8 {
+        var characters: [UInt8] = []
+        characters.reserveCapacity(40)
+        for byte in bytes {
+            characters.append(hexDigits[Int(byte >> 4)])
+            characters.append(hexDigits[Int(byte & 0x0F)])
+        }
+        return String(decoding: characters, as: UTF8.self)
     }
 
     // MARK: - Offline versus broken

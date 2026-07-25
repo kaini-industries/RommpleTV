@@ -656,6 +656,59 @@ final class PS1PackageStoreTests: XCTestCase {
 
         _ = try await store.prepare(twoDiscGame())
         XCTAssertGreaterThan(library.transferCount, 0, "a changed updated_at must force a rebuild")
+        XCTAssertEqual(entries(in: platformRoot(in: cacheRoot)), ["8300"])
+    }
+
+    func testSuccessfulRebuildOverAnExistingPackageLeavesNoBackup() async throws {
+        let cacheRoot = try tempDirectory()
+        let library = twoDiscLibrary()
+        let store = try makeStore(cacheRoot: cacheRoot, library: library)
+        _ = try await store.prepare(twoDiscGame())
+        library.resetCounters()
+
+        // Move the metadata on so the second prepare rebuilds over a package that
+        // is already there, which is the only path that takes promotion's backup
+        // branch. The negative rule (never remove the backup before the install)
+        // has three tests; this is the positive one.
+        let track = library.file(named: "Vault Runner (Disc 1) (Track 1).bin", in: 8300)
+        library.replaceFile(romID: 8300, fileID: track.id) { row in
+            RomFile(id: row.id, fileName: row.fileName, filePath: row.filePath,
+                    sizeBytes: row.sizeBytes, isTopLevel: row.isTopLevel, crcHash: row.crcHash,
+                    md5Hash: row.md5Hash, sha1Hash: row.sha1Hash,
+                    updatedAt: "2026-08-08T08:08:08")
+        }
+
+        _ = try await store.prepare(twoDiscGame())
+
+        XCTAssertGreaterThan(library.transferCount, 0, "precondition: this was a rebuild")
+        let root = platformRoot(in: cacheRoot)
+        XCTAssertEqual(backupDirectories(in: root), [],
+                       "a leaked backup is a whole duplicate game on a purgeable cache")
+        XCTAssertEqual(entries(in: root), ["8300"])
+        XCTAssertNil(invalidation(at: canonicalDirectory(cacheRoot, 8300), for: twoDiscGame()))
+    }
+
+    func testConcurrentPreparesForOneGameLeaveOneValidPackage() async throws {
+        let cacheRoot = try tempDirectory()
+        let library = twoDiscLibrary()
+        let store = try makeStore(cacheRoot: cacheRoot, library: library)
+        // Yielding inside every transfer makes the two runs interleave at the
+        // actor's suspension points instead of running end to end. What keeps the
+        // canonical path safe is that `promote` has none — see its doc comment.
+        library.transferHook = { _, _ in
+            for _ in 0..<4 { await Task.yield() }
+        }
+
+        async let first = store.prepare(twoDiscGame())
+        async let second = store.prepare(twoDiscGame())
+        let (a, b) = try await (first, second)
+
+        XCTAssertEqual(a.launchURL, b.launchURL)
+        XCTAssertEqual(a.totalBytes, b.totalBytes)
+        let root = platformRoot(in: cacheRoot)
+        XCTAssertEqual(entries(in: root), ["8300"])
+        XCTAssertEqual(partFiles(in: root), [])
+        XCTAssertNil(invalidation(at: canonicalDirectory(cacheRoot, 8300), for: twoDiscGame()))
     }
 
     func testChangedRemoteFileIDTriggersRebuild() async throws {
@@ -1027,15 +1080,23 @@ final class PS1PackageStoreTests: XCTestCase {
         }
     }
 
-    func testUnsupportedTopLevelLaunchExtensionIsRejected() async throws {
+    func testUnsupportedTopLevelLaunchExtensionNamesTheDiscImage() async throws {
         let cacheRoot = try tempDirectory()
         let library = FakeLibrary()
+        // A rip with no cue: a large image plus a small sidecar. RomM marks every
+        // row top-level, so the message has to pick by size — naming the sidecar
+        // would say "stored as \"Signal Drift.bin\". RommpleTV plays cue/bin discs
+        // only", which is both wrong and self-contradicting.
         library.add(.init(romID: 8400, folder: "psx/Signal Drift",
-                          cueName: "Signal Drift.iso", tracks: ["Signal Drift.bin"]))
+                          cueName: "Signal Drift.iso", tracks: ["Signal Drift.bin"],
+                          cueTextOverride: String(repeating: "0", count: 1 << 16)))
         let store = try makeStore(cacheRoot: cacheRoot, library: library)
+        XCTAssertLessThan(library.file(named: "Signal Drift.bin", in: 8400).sizeBytes,
+                          library.file(named: "Signal Drift.iso", in: 8400).sizeBytes,
+                          "precondition: the sidecar sorts first alphabetically and is smaller")
 
         await assertThrows(PS1PackageError.unsupportedLaunchFile(
-            label: "Disc 1", fileName: "Signal Drift.bin")) {
+            label: "Disc 1", fileName: "Signal Drift.iso")) {
             _ = try await store.prepare(self.singleDiscGame())
         }
         XCTAssertEqual(library.transferCount, 0)
@@ -1390,6 +1451,23 @@ final class PS1PackageStoreTests: XCTestCase {
 
         XCTAssertEqual(entries(in: root), ["8300"])
         XCTAssertEqual(snapshot(canonical)["game.m3u"], Data("new".utf8))
+    }
+
+    func testAnUnparsableBackupNameIsLeftAloneRatherThanDeleted() throws {
+        // "I cannot tell which game this belongs to" is not a reason to delete a
+        // whole package. It costs space; deleting it costs the only copy.
+        let cacheRoot = try tempDirectory()
+        let root = platformRoot(in: cacheRoot)
+        let name = ".backup-not-a-number-\(UUID().uuidString)"
+        let backup = root.appendingPathComponent(name, isDirectory: true)
+        try FileManager.default.createDirectory(at: backup, withIntermediateDirectories: true)
+        try Data("playlist".utf8).write(to: backup.appendingPathComponent("game.m3u"))
+        let expected = snapshot(backup)
+
+        _ = try makeStore(cacheRoot: cacheRoot, library: FakeLibrary())
+
+        XCTAssertEqual(entries(in: root), [name])
+        XCTAssertEqual(snapshot(backup), expected)
     }
 
     func testInitializationRemovesAbandonedStagingButKeepsTheCanonicalPackage() async throws {
@@ -1912,6 +1990,40 @@ final class PS1PackageStoreTests: XCTestCase {
             ofItemAtPath: track.path)
 
         XCTAssertNil(invalidation(at: package, for: singleDiscGame()))
+    }
+
+    // MARK: - Rehashing
+
+    func testStreamingSHA1AgreesWithTheFullDigest() throws {
+        // `sha1OfFile` runs SHA-1 alone rather than paying for MD5 and CRC-32 it
+        // discards. Two formatters now produce the string the rehash compares, so
+        // they are pinned against each other rather than trusted to agree.
+        let directory = try tempDirectory()
+        for count in [0, 1, 1 << 16, (1 << 16) * 3 + 517] {
+            let url = directory.appendingPathComponent("blob-\(count).bin")
+            let data = FakeLibrary.bytes(id: 7 + count, count: count)
+            try data.write(to: url)
+            var reference = IncrementalFileDigest()
+            reference.update(data)
+            XCTAssertEqual(PS1PackageStore.sha1OfFile(at: url), reference.finalized().sha1,
+                           "\(count) bytes")
+        }
+    }
+
+    func testStreamingSHA1StopsWhenTheTaskIsCancelled() async throws {
+        let directory = try tempDirectory()
+        let url = directory.appendingPathComponent("blob.bin")
+        try FakeLibrary.bytes(id: 11, count: 1 << 18).write(to: url)
+
+        // A cancelled prepare must not be stuck rehashing a whole disc on the
+        // actor while everything else queues behind it.
+        let task = Task { () -> String? in
+            while !Task.isCancelled { await Task.yield() }
+            return PS1PackageStore.sha1OfFile(at: url)
+        }
+        task.cancel()
+        let hashed = await task.value
+        XCTAssertNil(hashed)
     }
 
     // MARK: - Helpers
