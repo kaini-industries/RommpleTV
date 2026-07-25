@@ -104,7 +104,7 @@ struct GameGridView: View {
     /// a platform that legitimately has no games — also runs with an empty grid,
     /// and gating the controls on emptiness would delete the row the user is
     /// standing on for the length of that request. Once true this never goes
-    /// back to false, so the control row, once it exists, is permanent.
+    /// back to false, so the top control row, once it exists, is permanent.
     @State private var hasSettledOnce = false
 
     private let columns = [GridItem(.adaptive(minimum: 220), spacing: 32)]
@@ -210,7 +210,8 @@ struct GameGridView: View {
     /// finished: there is nothing yet to sort, resize, or page through, and
     /// leaving them out means the focus engine has nowhere to park focus — so
     /// the page that lands can take focus without taking it from anything. From
-    /// the first settle onward the row is permanent, whatever the grid contains.
+    /// the first settle onward the top row is permanent, whatever the grid
+    /// contains; the bottom row comes and goes with the grid itself.
     ///
     /// `hasSettledOnce` is set by an observer, which runs *after* the body that
     /// first draws the page it settled on. The `!items.isEmpty` term is what
@@ -218,10 +219,17 @@ struct GameGridView: View {
     /// instead of one pass behind it — which is also the timing the original
     /// predicate had, so the first-entry focus behaviour is unchanged.
     ///
-    /// That the row is never torn down once it appears is also what keeps
-    /// `focusedControl` from being left pointing at a view that no longer
-    /// exists, which would arm `focusPreferredTile`'s no-steal guard
-    /// permanently and leave every later page with no focused tile.
+    /// That the *top* row is never torn down once it appears is what keeps its
+    /// six focus identities — the two menus and `.paging(_, .top)` — from
+    /// leaving `focusedControl` pointing at a view that no longer exists.
+    ///
+    /// The bottom row is not covered by that, and does not claim to be: it
+    /// lives inside `content`'s `!model.items.isEmpty` branch, so its four
+    /// `.paging(_, .bottom)` identities do go away when a page commits empty.
+    /// If focus was on one of them, `focusedControl` is left stale and
+    /// `focusPreferredTile`'s no-steal guard stays armed — but only until the
+    /// user's next focus move, which rewrites the binding. The cost is one page
+    /// that does not auto-focus a tile, not a permanently dead guard.
     private var showsControls: Bool { hasSettledOnce || !model.items.isEmpty }
 
     @ViewBuilder
