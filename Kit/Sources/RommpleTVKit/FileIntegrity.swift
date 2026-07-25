@@ -338,7 +338,27 @@ public struct StreamingFileDownloader: Sendable {
         expected: ExpectedFileIntegrity,
         progress: @Sendable (Int64) -> Void
     ) async throws -> FileDigest {
-        let (bytes, response) = try await session.bytes(for: request)
+        // `bytes(for:)` is the one await that sits outside the write loop, and
+        // Foundation reports a cancellation here as `URLError.cancelled` rather
+        // than `CancellationError`. A caller decides between "the player backed
+        // out, say nothing" and "show a network error" on the error's type, so
+        // that must not depend on whether the cancellation arrived before or
+        // after the first byte. This is the request/header half of the same
+        // normalization `write` does for the body.
+        let bytes: URLSession.AsyncBytes
+        let response: URLResponse
+        do {
+            (bytes, response) = try await session.bytes(for: request)
+        } catch {
+            if Task.isCancelled { throw CancellationError() }
+            throw error
+        }
+        // Both refusals below abandon `bytes` without ever iterating it. That is
+        // safe, and measured rather than assumed: `AsyncBytes` applies
+        // backpressure by leaving its data task *suspended* until the iterator
+        // asks for bytes, and Foundation stops the load when the un-iterated
+        // sequence is deallocated. No body is fetched for a response that has
+        // already been refused, so there is nothing here to cancel by hand.
         guard let http = response as? HTTPURLResponse else {
             throw FileIntegrityError.notAnHTTPResponse
         }
@@ -404,7 +424,16 @@ public struct StreamingFileDownloader: Sendable {
             return result
         } catch {
             try? handle.close()
+            // Best effort: if the removal itself fails, the caller still sees why
+            // the download failed rather than why the cleanup did, and the next
+            // attempt truncates the file anyway.
             try? FileManager.default.removeItem(at: partURL)
+            // Deliberate: once the task is cancelled, *any* error in flight is
+            // reported as cancellation. A digest mismatch that races a cancel is
+            // therefore lost. That is the right trade — the file is deleted
+            // either way, nothing is promoted, and a caller that has just said
+            // "stop" should not be shown a verification error for a transfer it
+            // abandoned.
             if Task.isCancelled { throw CancellationError() }
             throw error
         }

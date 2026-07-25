@@ -64,6 +64,9 @@ final class ScriptedBodyProtocol: URLProtocol {
         var beforeChunk: (@Sendable (_ index: Int) -> Bool)?
         /// Fail the body with this error instead of finishing it.
         var failure: URLError.Code?
+        /// Accept the request and then say nothing at all — no response, no
+        /// body, no completion. Parks a caller inside `bytes(for:)`.
+        var stall = false
     }
 
     private static let stateLock = NSLock()
@@ -104,6 +107,7 @@ final class ScriptedBodyProtocol: URLProtocol {
     override func startLoading() {
         Self.stateLock.lock(); Self._startedRequests += 1; Self.stateLock.unlock()
         let script = Self.script
+        guard !script.stall else { return }
         Self.queue.async {
             if script.nonHTTPResponse {
                 let response = URLResponse(url: self.request.url!,
@@ -284,6 +288,21 @@ final class FileIntegrityTests: XCTestCase {
             }
         } else {
             incremental.update(data)
+        }
+        return incremental.finalized()
+    }
+
+    /// Re-reads a file from disk and digests it, so a returned `FileDigest` can
+    /// be checked against the bytes that actually landed rather than against the
+    /// downloader's own account of them. Task 6 promotes a `.part` file on the
+    /// strength of the returned digest without re-reading it, so "the digest
+    /// describes the file" is a claim that has to be tested, not assumed.
+    private func digestOfFile(at url: URL, readingIn chunkSize: Int = 64 << 10) throws -> FileDigest {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var incremental = IncrementalFileDigest()
+        while let chunk = try handle.read(upToCount: chunkSize), !chunk.isEmpty {
+            incremental.update(chunk)
         }
         return incremental.finalized()
     }
@@ -729,7 +748,15 @@ final class FileIntegrityTests: XCTestCase {
     }
 
     /// End to end: a megabyte body, streamed through `URLSession`, hashed
-    /// incrementally, checked against the published one-million-'a' vectors.
+    /// incrementally, checked against the published one-million-'a' vectors —
+    /// and then checked against the file that is actually on disk.
+    ///
+    /// The last part matters more than it looks. Every other body whose
+    /// *contents* are asserted here is smaller than one buffer, so it is written
+    /// by the single post-loop flush. Without this, an implementation that
+    /// re-wrote the first buffer each time, or wrote at the wrong offset, would
+    /// produce a file of the right length and the wrong bytes and hand back a
+    /// digest saying it was fine.
     func testDownloadOfTheMillionCharacterVectorMatchesThePublishedDigests() async throws {
         let expected = try ExpectedFileIntegrity(size: 1_000_000, sha1: Vector.millionASHA1,
                                                  md5: Vector.millionAMD5, crc32: Vector.millionACRC32)
@@ -739,6 +766,13 @@ final class FileIntegrityTests: XCTestCase {
         XCTAssertEqual(digest.md5, Vector.millionAMD5)
         XCTAssertEqual(digest.crc32, Vector.millionACRC32)
         XCTAssertEqual(sizeOfFile(at: part), 1_000_000)
+
+        // The returned digest must describe the bytes on disk, over a body of
+        // sixteen buffers.
+        XCTAssertEqual(try digestOfFile(at: part), digest)
+        // And independently of the hashing code entirely.
+        XCTAssertTrue(try Data(contentsOf: part) == Vector.millionA,
+                      "the file on disk is not the body that was sent")
     }
 
     // MARK: - Streaming, proved rather than asserted
@@ -752,8 +786,12 @@ final class FileIntegrityTests: XCTestCase {
     /// everything produced so far, and one that streams shows at most one
     /// buffer. There is no sleeping and nothing to time out.
     private func measureStreamingLag(
-        blockCount: Int, blockSize: Int, bufferByteCount: Int
+        blockCount: Int, blockSize: Int, bufferByteCount: Int,
+        file: StaticString = #filePath, line: UInt = #line
     ) async throws -> (digest: FileDigest, maximumLag: Int64) {
+        // Every block has different contents, so a loop that wrote the right
+        // number of bytes from the wrong buffer, or at the wrong offset, cannot
+        // produce a file that re-digests to the same answer.
         let blocks = (0..<blockCount).map { index in
             [UInt8](repeating: UInt8(index % 251), count: blockSize)
         }
@@ -768,6 +806,12 @@ final class FileIntegrityTests: XCTestCase {
         let digest = try await downloader.write(source, to: partURL,
                                                 expected: ExpectedFileIntegrity(size: total),
                                                 progress: { _ in })
+        XCTAssertEqual(try digestOfFile(at: partURL), digest,
+                       "the returned digest does not describe the bytes on disk",
+                       file: file, line: line)
+        XCTAssertTrue(try Data(contentsOf: partURL) == Data(blocks.flatMap { $0 }),
+                      "the file on disk is not the body that was sent",
+                      file: file, line: line)
         return (digest, lags.all.max() ?? 0)
     }
 
@@ -794,6 +838,8 @@ final class FileIntegrityTests: XCTestCase {
             blockCount: 64, blockSize: blockSize, bufferByteCount: 4 * blockSize)
         XCTAssertEqual(digest.size, Int64(64 * blockSize))
         XCTAssertLessThanOrEqual(maximumLag, Int64(4 * blockSize))
+        XCTAssertLessThan(maximumLag * 8, digest.size,
+                          "the bound is only meaningful if the body is much larger than it")
     }
 
     /// The same claim across the real `URLSession` path, where the risk is that
@@ -927,6 +973,7 @@ final class FileIntegrityTests: XCTestCase {
         let result = await runDownload(body: Vector.fox + Data([0x00]), expected: expected)
         assertIntegrityError(result, .bodyTooLong(expected: Vector.foxSize,
                                                   seenAtLeast: Vector.foxSize + 1))
+        XCTAssertFalse(fileExists(at: part))
     }
 
     // MARK: - Hash mismatches
@@ -1109,6 +1156,57 @@ final class FileIntegrityTests: XCTestCase {
         let task = Task { try await downloader.write(source, to: partURL, expected: expected,
                                                      progress: { _ in }) }
         box.publish(task)
+
+        switch await task.result {
+        case let .success(digest): XCTFail("a cancelled download must not succeed: \(digest)")
+        case let .failure(error): XCTAssertTrue(error is CancellationError, "got \(error)")
+        }
+        XCTAssertFalse(fileExists(at: partURL))
+    }
+
+    /// Cancellation while the request is still in flight — before a single
+    /// header has come back — is the case that lives outside the write loop
+    /// entirely. The stub accepts the request and then says nothing at all, so
+    /// the download is parked inside `session.bytes(for:)`, which is where
+    /// Foundation reports cancellation as `URLError.cancelled`.
+    ///
+    /// In production this is Task 6 cancelling a per-file loop mid-package: the
+    /// in-flight file must not report a *network error* while its neighbour
+    /// reports cancellation.
+    func testCancellationBeforeTheResponseArrivesIsReportedAsCancellation() async throws {
+        let session = ScriptedBodyProtocol.session(.init(stall: true))
+        let downloader = StreamingFileDownloader(session: session)
+        let expected = try ExpectedFileIntegrity(size: Vector.foxSize)
+        let partURL = part!
+
+        let task = Task { try await downloader.download(request: request(), to: partURL,
+                                                        expected: expected, progress: { _ in }) }
+        XCTAssertTrue(waitUntil(10) { ScriptedBodyProtocol.startedRequests == 1 },
+                      "the request never reached the loading system")
+        task.cancel()
+
+        switch await task.result {
+        case let .success(digest): XCTFail("a cancelled download must not succeed: \(digest)")
+        case let .failure(error): XCTAssertTrue(error is CancellationError, "got \(error)")
+        }
+        XCTAssertFalse(fileExists(at: partURL), "no part file may be created")
+    }
+
+    /// The same rule for a task that was already cancelled before `download` was
+    /// ever awaited — the shape of a package loop whose caller backed out
+    /// between files.
+    func testDownloadOnAnAlreadyCancelledTaskIsReportedAsCancellation() async throws {
+        let session = ScriptedBodyProtocol.session(.init(status: 200, chunks: [Vector.fox]))
+        let downloader = StreamingFileDownloader(session: session)
+        let expected = try ExpectedFileIntegrity(size: Vector.foxSize)
+        let partURL = part!
+
+        let task = Task { () -> FileDigest in
+            while !Task.isCancelled { await Task.yield() }
+            return try await downloader.download(request: request(), to: partURL,
+                                                 expected: expected, progress: { _ in })
+        }
+        task.cancel()
 
         switch await task.result {
         case let .success(digest): XCTFail("a cancelled download must not succeed: \(digest)")
