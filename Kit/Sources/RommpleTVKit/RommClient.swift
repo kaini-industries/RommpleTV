@@ -103,30 +103,38 @@ public final class RommClient: @unchecked Sendable {
     /// route is `/api/roms/{rom_file_id}/files/content/{file_name}`. Passing the
     /// ROM id here fetches an unrelated file or 404s.
     public func romFileRequest(fileID: Int, fileName: String) -> URLRequest {
-        authorizedRequest(url(["/api/roms/\(fileID)/files/content", fileName]))
+        authorizedRequest(url("/api/roms/\(fileID)/files/content", fileName: fileName))
     }
 
     public func firmwareContentRequest(id: Int, fileName: String) -> URLRequest {
-        authorizedRequest(url(["/api/firmware/\(id)/content", fileName]))
+        authorizedRequest(url("/api/firmware/\(id)/content", fileName: fileName))
     }
 
     public func saveContentRequest(id: Int) -> URLRequest {
-        authorizedRequest(url(["/api/saves/\(id)/content"]))
+        authorizedRequest(url("/api/saves/\(id)/content"))
     }
 
-    /// Append a new save version.
+    /// Post a memory-card save.
     ///
-    /// Always a POST with `overwrite=false`: RomM 5's update API exposes no
-    /// hash/ETag precondition, so updating bytes in place is an uncloseable
-    /// lost-update race. Appending instead makes concurrent writers produce
-    /// distinct records that a caller can compare. Active cards pass
-    /// `autocleanup: true` so the server retains only `autocleanupLimit`
-    /// versions; conflict archives pass `autocleanup: false` and their own slot.
+    /// This client only ever sends the create shape: `POST /api/saves` with
+    /// `overwrite=false`. It never issues the in-place `PUT /api/saves/{id}`,
+    /// because that update API exposes no hash/ETag precondition and so cannot
+    /// close a lost-update race. `overwrite=false` asks the server to refuse
+    /// rather than clobber when the slot has moved on since the caller's last
+    /// sync; `send` surfaces that refusal as `RommError.http(409)`, which a
+    /// coordinator can catch to detect the newer-save case and reconcile.
     ///
-    /// `fileName` names the single `saveFile` part. Callers pass
+    /// What RomM does with the row behind this request — append a version or
+    /// update an existing one for the same `(rom_id, file_name, slot)` — is the
+    /// server's business and is not asserted here; the caller must not assume
+    /// each POST yields a distinct record. Active cards pass `autocleanup: true`
+    /// so the server prunes to `autocleanupLimit` versions; conflict archives
+    /// pass `autocleanup: false` and their own timestamped slot.
+    ///
+    /// `fileName` names the single `saveFile` part and defaults to the constant
     /// `RommClient.memoryCardFileName`; it is never derived from a game title.
     public func createSave(
-        fileName: String,
+        fileName: String = RommClient.memoryCardFileName,
         romID: Int,
         emulator: String,
         slot: String,
@@ -135,7 +143,7 @@ public final class RommClient: @unchecked Sendable {
         autocleanup: Bool,
         autocleanupLimit: Int = 10
     ) async throws -> RommSave {
-        var request = authorizedRequest(url(["/api/saves"], query: [
+        var request = authorizedRequest(url("/api/saves", query: [
             "rom_id": String(romID),
             "emulator": emulator,
             "slot": slot,
@@ -175,13 +183,28 @@ public final class RommClient: @unchecked Sendable {
         return body
     }
 
-    /// Builds a URL from unescaped path components, so a filename containing a
-    /// space or `#` is percent-encoded instead of truncating the URL. Query
-    /// items are sorted by key for stable request shapes.
-    private func url(_ pathComponents: [String], query: [String: String] = [:]) -> URL {
-        var built = config.baseURL
-        for component in pathComponents { built = built.appendingPathComponent(component) }
-        var comps = URLComponents(url: built, resolvingAgainstBaseURL: false)!
+    /// Everything legal in a URL path *except* `/`, so one server-supplied name
+    /// stays one path component.
+    private static let pathComponentAllowed: CharacterSet = {
+        var allowed = CharacterSet.urlPathAllowed
+        allowed.remove("/")
+        return allowed
+    }()
+
+    /// Builds a URL from a trusted literal `path` plus at most one untrusted
+    /// `fileName` component. The filename is percent-encoded with `/` excluded,
+    /// so a space or `#` cannot truncate the URL and an embedded `/` (hence
+    /// `../`) cannot add segments or traverse to another file. Query items are
+    /// sorted by key for stable request shapes.
+    private func url(_ path: String, fileName: String? = nil,
+                     query: [String: String] = [:]) -> URL {
+        var comps = URLComponents(url: config.baseURL.appendingPathComponent(path),
+                                  resolvingAgainstBaseURL: false)!
+        if let fileName {
+            let encoded = fileName
+                .addingPercentEncoding(withAllowedCharacters: Self.pathComponentAllowed)!
+            comps.percentEncodedPath += "/" + encoded
+        }
         if !query.isEmpty {
             comps.queryItems = query.sorted { $0.key < $1.key }
                 .map { URLQueryItem(name: $0.key, value: $0.value) }
@@ -190,7 +213,7 @@ public final class RommClient: @unchecked Sendable {
     }
 
     private func get<T: Decodable>(_ type: T.Type, path: String, query: [String: String]) async throws -> T {
-        try await send(type, request: authorizedRequest(url([path], query: query)))
+        try await send(type, request: authorizedRequest(url(path, query: query)))
     }
 
     private func send<T: Decodable>(_ type: T.Type, request: URLRequest) async throws -> T {

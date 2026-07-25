@@ -528,6 +528,26 @@ final class RommClientTests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer not-a-secret")
         XCTAssertFalse(url.absoluteString.contains("not-a-secret"),
                        "token must never reach the URL")
+
+        // A server-supplied file_name is one path component and must stay one:
+        // an unescaped '/' would let it split into segments, and '..' would then
+        // normalize into a traversal to a different file on the same host.
+        let hostile = client.romFileRequest(fileID: 9634, fileName: "../../etc/passwd")
+        let hostileURL = try XCTUnwrap(hostile.url)
+        XCTAssertEqual(hostileURL.absoluteString,
+            "https://romm.example/api/roms/9634/files/content/..%2F..%2Fetc%2Fpasswd")
+        // Compare *encoded* paths: URL.pathComponents percent-decodes, which
+        // would re-split %2F and hide exactly the property under test.
+        let hostilePath = try XCTUnwrap(
+            URLComponents(url: hostileURL, resolvingAgainstBaseURL: false)?.percentEncodedPath)
+        let benignPath = try XCTUnwrap(
+            URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedPath)
+        XCTAssertEqual(hostilePath, "/api/roms/9634/files/content/..%2F..%2Fetc%2Fpasswd")
+        XCTAssertEqual(hostilePath.filter { $0 == "/" }.count,
+                       benignPath.filter { $0 == "/" }.count,
+                       "an embedded '/' must not add path segments")
+        XCTAssertEqual(hostileURL.standardized.absoluteString, hostileURL.absoluteString,
+                       "'..' must not normalize into a traversal")
     }
 
     func testFirmwareContentRequestUsesFileName() throws {
@@ -568,7 +588,10 @@ final class RommClientTests: XCTestCase {
         }
 
         XCTAssertEqual(RommClient.memoryCardFileName, "RommpleTV Memory Card.mcr")
-        let save = try await makeClient().createSave(
+        // One client for every upload in this test: a boundary hoisted to a
+        // per-instance stored property would otherwise still look "generated".
+        let client = makeClient()
+        let save = try await client.createSave(
             fileName: RommClient.memoryCardFileName,
             romID: 8343,
             emulator: "mednafen_psx",
@@ -616,8 +639,15 @@ final class RommClientTests: XCTestCase {
         XCTAssertEqual(occurrences(of: "Example Adventure", in: body), 0,
                        "upload filenames must never be derived from a game title")
 
-        // Exact bytes between the part headers and the closing boundary.
-        let headerEnd = try XCTUnwrap(body.range(of: Data("\r\n\r\n".utf8)))
+        // The part declares a binary payload, and the exact bytes sit between
+        // that header and the closing boundary. Anchoring the payload on this
+        // header (rather than the first blank line) means deleting the header
+        // fails the byte-exactness check too, not just the count below.
+        XCTAssertEqual(
+            occurrences(of: "Content-Type: application/octet-stream\r\n\r\n", in: body), 1,
+            "the saveFile part must declare application/octet-stream")
+        let headerEnd = try XCTUnwrap(
+            body.range(of: Data("Content-Type: application/octet-stream\r\n\r\n".utf8)))
         let closing = try XCTUnwrap(body.range(of: Data("\r\n--\(boundary)--".utf8)))
         XCTAssertEqual(Data(body[headerEnd.upperBound..<closing.lowerBound]), cardBytes)
 
@@ -632,19 +662,24 @@ final class RommClientTests: XCTestCase {
             XCTAssertFalse(value.contains("not-a-secret"), "token leaked into header \(name)")
         }
 
-        // A second upload must not reuse the first boundary.
-        _ = try await makeClient().createSave(
-            fileName: RommClient.memoryCardFileName, romID: 8343, emulator: "mednafen_psx",
-            slot: "0", deviceID: "example-device-id", data: cardBytes, autocleanup: true
+        // A second upload on the *same* client must not reuse the first
+        // boundary, and omitting `fileName` must still send the constant — the
+        // safe filename is the default, not a call-site convention.
+        _ = try await client.createSave(
+            romID: 8343, emulator: "mednafen_psx", slot: "0",
+            deviceID: "example-device-id", data: cardBytes, autocleanup: true
         )
-        let secondContentType = try XCTUnwrap(
-            try XCTUnwrap(captured).value(forHTTPHeaderField: "Content-Type"))
-        XCTAssertNotEqual(secondContentType, contentType, "boundary must be generated per upload")
+        let secondRequest = try XCTUnwrap(captured)
+        let secondContentType = try XCTUnwrap(secondRequest.value(forHTTPHeaderField: "Content-Type"))
+        XCTAssertNotEqual(secondContentType, contentType, "boundary must be generated per request")
+        XCTAssertEqual(
+            occurrences(of: "filename=\"RommpleTV Memory Card.mcr\"", in: requestBody(secondRequest)), 1,
+            "the default fileName must be the constant memory-card name")
 
         // Conflict archives disable autocleanup and use their own slot; the
         // POST stays append-only either way.
-        _ = try await makeClient().createSave(
-            fileName: RommClient.memoryCardFileName, romID: 8343, emulator: "mednafen_psx",
+        _ = try await client.createSave(
+            romID: 8343, emulator: "mednafen_psx",
             slot: "conflict-20260303T090000Z-abc", deviceID: "example-device-id",
             data: cardBytes, autocleanup: false
         )
