@@ -43,9 +43,11 @@ public struct Rom: Identifiable, Decodable, Sendable {
     public let coverPath: String?
     // Present only for grouped (group_by_meta_id) responses; absent roms decode to [].
     public let siblingRoms: [SiblingRom]
+    // Scraped release regions (e.g. ["USA"]). Absent or unscraped roms decode to [].
+    public let regions: [String]
 
     public init(id: Int, name: String?, fsName: String, platformId: Int, sizeBytes: Int64?,
-                coverPath: String?, siblingRoms: [SiblingRom] = []) {
+                coverPath: String?, siblingRoms: [SiblingRom] = [], regions: [String] = []) {
         self.id = id
         self.name = name
         self.fsName = fsName
@@ -53,12 +55,13 @@ public struct Rom: Identifiable, Decodable, Sendable {
         self.sizeBytes = sizeBytes
         self.coverPath = coverPath
         self.siblingRoms = siblingRoms
+        self.regions = regions
     }
 
     enum CodingKeys: String, CodingKey {
         case id, name, fsName = "fs_name", platformId = "platform_id",
              sizeBytes = "fs_size_bytes", coverPath = "path_cover_small",
-             siblingRoms = "sibling_roms"
+             siblingRoms = "sibling_roms", regions
     }
 
     public init(from decoder: Decoder) throws {
@@ -70,6 +73,89 @@ public struct Rom: Identifiable, Decodable, Sendable {
         sizeBytes = try c.decodeIfPresent(Int64.self, forKey: .sizeBytes)
         coverPath = try c.decodeIfPresent(String.self, forKey: .coverPath)
         siblingRoms = try c.decodeIfPresent([SiblingRom].self, forKey: .siblingRoms) ?? []
+        regions = try c.decodeIfPresent([String].self, forKey: .regions) ?? []
+    }
+}
+
+/// One file belonging to a ROM, from `/api/roms/{id}`'s `files[]`. Multi-file
+/// ROMs (a PS1 disc's `.cue` plus its tracks) are transferred file by file, and
+/// each file is addressed by this `id` — the internal RomFile id, which is *not*
+/// the parent ROM id. Only fields the transfer path consumes are modeled;
+/// RomM sends several more.
+public struct RomFile: Identifiable, Decodable, Sendable {
+    public let id: Int
+    public let fileName: String
+    public let filePath: String
+    public let sizeBytes: Int64
+    public let isTopLevel: Bool
+    // Integrity metadata is optional on RomM; unhashed files must still decode.
+    public let crcHash: String?
+    public let md5Hash: String?
+    public let sha1Hash: String?
+    public let updatedAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case id, fileName = "file_name", filePath = "file_path",
+             sizeBytes = "file_size_bytes", isTopLevel = "is_top_level",
+             crcHash = "crc_hash", md5Hash = "md5_hash", sha1Hash = "sha1_hash",
+             updatedAt = "updated_at"
+    }
+}
+
+/// The single-ROM detail response, which — unlike the library listing — carries
+/// the per-file breakdown needed to fetch every track of a multi-file disc.
+public struct RomDetails: Decodable, Sendable {
+    public let id: Int
+    public let fsName: String
+    public let files: [RomFile]
+
+    enum CodingKeys: String, CodingKey {
+        case id, fsName = "fs_name", files
+    }
+}
+
+/// A BIOS image registered for a platform, with the integrity metadata a caller
+/// needs to reject an unusable one (missing from disk, unverified, wrong hash).
+public struct RommFirmware: Identifiable, Decodable, Sendable {
+    public let id: Int
+    public let fileName: String
+    public let fileSizeBytes: Int64
+    public let isVerified: Bool
+    public let crcHash: String?
+    public let md5Hash: String?
+    public let sha1Hash: String?
+    public let missingFromFS: Bool
+    public let updatedAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case id, fileName = "file_name", fileSizeBytes = "file_size_bytes",
+             isVerified = "is_verified", crcHash = "crc_hash", md5Hash = "md5_hash",
+             sha1Hash = "sha1_hash", missingFromFS = "missing_from_fs",
+             updatedAt = "updated_at"
+    }
+}
+
+/// A stored save record. `emulator`, `slot`, `contentHash` and `originDeviceID`
+/// are optional because saves written by other clients carry no identity fields;
+/// they must decode so the caller can filter them out rather than fail the list.
+public struct RommSave: Identifiable, Decodable, Sendable {
+    public let id: Int
+    public let romID: Int
+    public let fileName: String
+    public let fileSizeBytes: Int64
+    public let missingFromFS: Bool
+    public let createdAt: String
+    public let updatedAt: String
+    public let emulator: String?
+    public let slot: String?
+    public let contentHash: String?
+    public let originDeviceID: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, romID = "rom_id", fileName = "file_name",
+             fileSizeBytes = "file_size_bytes", missingFromFS = "missing_from_fs",
+             createdAt = "created_at", updatedAt = "updated_at", emulator, slot,
+             contentHash = "content_hash", originDeviceID = "origin_device_id"
     }
 }
 
