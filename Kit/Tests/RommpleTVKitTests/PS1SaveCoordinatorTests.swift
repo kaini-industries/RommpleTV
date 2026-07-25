@@ -1333,6 +1333,11 @@ final class PS1SaveCoordinatorTests: XCTestCase {
         }
         XCTAssertEqual(server.activeUploads[0].data, cardA)
         XCTAssertTrue(storedPending, "the newer card is still owed")
+
+        // Owed is not enough: the next retry has to actually send it.
+        await coordinator.retryPending(reason: .quit)
+        XCTAssertEqual(server.activeUploads.map(\.data), [cardA, cardB])
+        XCTAssertFalse(storedPending)
     }
 
     // MARK: - One flush at a time
@@ -1375,6 +1380,47 @@ final class PS1SaveCoordinatorTests: XCTestCase {
         XCTAssertEqual(store.card(romID), cardB, "the live card must not be reverted")
         XCTAssertFalse(storedPending)
         XCTAssertEqual(storedBaselineHash, hash(cardB))
+    }
+
+    /// Waiting out an in-flight flush is not the same as absorbing into it. A card
+    /// that arrives mid-flush leaves `settlePending` holding the flag, and both
+    /// callers that reach `flush()` have already retired the trigger that would
+    /// have sent it — `retryPending` bumps the generation on its way in, and a
+    /// debounce firing is consumed. A caller that returned without doing a pass
+    /// would leave the newest card on disk, flagged, with nothing scheduled: a
+    /// silent stall, and this is the quit path.
+    func testACardThatArrivesDuringAFlushIsSentByTheRetryThatFollowsIt() async throws {
+        let downloadGate = Gate()
+        server.downloadGate = downloadGate
+        server.seed(record(id: 5), bytes: cardA)
+        seedBaseline(hash: hash(cardA), remoteID: 5)
+        store.put(cardB, romID: romID)
+
+        let coordinator = makeCoordinator(seams(sleepGate: Gate()))
+        await coordinator.scheduleUpload(cardB)
+        let inFlight = Task { await coordinator.retryPending(reason: .user) }
+        await downloadGate.untilArrivals(1)
+
+        // The pause path: a newer card arrives and arms a debounce, and the pause
+        // retry then retires that debounce on its way in.
+        store.put(cardC, romID: romID)
+        await coordinator.scheduleUpload(cardC)
+        let pause = Task { await coordinator.retryPending(reason: .pause) }
+        var spins = 0
+        while await downloadGate.arrivalCount() < 2, spins < 200 {
+            await Task.yield()
+            spins += 1
+        }
+        await downloadGate.release()
+        await inFlight.value
+        await pause.value
+
+        XCTAssertEqual(server.activeUploads.map(\.data), [cardB, cardC],
+                       "the card that arrived mid-flush must actually go out, not just stay flagged")
+        XCTAssertFalse(storedPending)
+        XCTAssertEqual(storedBaselineHash, hash(cardC))
+        let standing = await coordinator.status
+        XCTAssertEqual(standing, .synced)
     }
 
     /// An owed upload must not displace an outstanding conflict in the published

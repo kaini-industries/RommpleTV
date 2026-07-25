@@ -610,8 +610,9 @@ public actor PS1SaveCoordinator {
     /// be uploaded, clear the pending flag, and record a baseline the local card
     /// does not match — after which the next reconciliation reads "local changed,
     /// remote did not" and uploads the *older* card over the newer remote one.
-    /// `EmulatorEngine.flushSRAMIfNeeded` therefore calls this only inside the
-    /// `do` block, after `try save` has returned.
+    /// So the call belongs **inside** the `do` block, after `try save` has
+    /// returned, and never on a tick where the write threw. Task 11 wires
+    /// `EmulatorEngine.flushSRAMIfNeeded`; nothing in `App/` calls this yet.
     ///
     /// The bytes are kept in memory, never in UserDefaults. The *flag* is
     /// persisted, so a cold start after a crash knows there is an upload owed and
@@ -676,18 +677,37 @@ public actor PS1SaveCoordinator {
     ///
     /// Choosing `remote` there archives the live card and writes the stale one
     /// over it: a session silently reverted, recoverable only out of a
-    /// `conflict-` slot. So a second caller waits for the first rather than
-    /// starting its own; the pending card is the same one either way, and a card
-    /// that arrived in between keeps the flag set for the debounce it armed.
+    /// `conflict-` slot.
+    ///
+    /// So a second caller **waits out** whatever is in flight and then does its
+    /// own pass. It must not simply absorb into the running one and return:
+    /// `settlePending` is exactly the success-with-work-still-owed branch, so the
+    /// flush being waited on can finish having left a *newer* card owed — and both
+    /// callers that get here have already retired the trigger that would have sent
+    /// it (`retryPending` bumps `uploadGeneration` on the way in, and a debounce
+    /// firing is consumed). Absorbing would leave the newest card on disk, flagged,
+    /// with nothing scheduled to send it: a silent stall on the quit path whenever
+    /// a flush is in flight.
+    ///
+    /// The loop terminates because each pass either clears the flag or returns at
+    /// `performFlush`'s own `isPending` guard, and it cannot spin: the slot is
+    /// released *inside* the task, so a waiter woken by a task's completion is
+    /// guaranteed to observe the slot already empty rather than re-observing a
+    /// finished task while its owner is still queued to clear it. Mutual exclusion
+    /// is unchanged — there is no suspension point between the final `flushTask`
+    /// check and the assignment, so two callers cannot both find it empty.
     private func flush() async {
-        if let existing = flushTask {
-            await existing.value
-            return
-        }
-        let task = Task { await self.performFlush() }
+        while let existing = flushTask { await existing.value }
+        let task = Task { await self.runFlush() }
         flushTask = task
-        defer { flushTask = nil }
         await task.value
+    }
+
+    /// One flush plus the release of the in-flight slot, as one task. See
+    /// `flush()` for why the release lives in here rather than after the await.
+    private func runFlush() async {
+        await performFlush()
+        flushTask = nil
     }
 
     /// One upload attempt for the pending card. Only ever entered through
