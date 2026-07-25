@@ -80,7 +80,7 @@ private final class FakeFirmwareServer: @unchecked Sendable {
 
     private var listCallsStorage: [Int] = []
     private var requestedStorage: [(id: Int, fileName: String)] = []
-    private var transferredStorage: [(id: Int, expected: ExpectedFileIntegrity)] = []
+    private var transferredStorage: [(id: Int, expected: ExpectedFileIntegrity, partURL: URL)] = []
 
     /// Runs before the firmware list resolves; throw to fail it.
     var listHook: (@Sendable (Int) async throws -> Void)?
@@ -141,6 +141,10 @@ private final class FakeFirmwareServer: @unchecked Sendable {
     var transferredIDs: [Int] {
         lock.lock(); defer { lock.unlock() }; return transferredStorage.map(\.id)
     }
+    /// The part path each transfer was handed, in order.
+    var partPaths: [String] {
+        lock.lock(); defer { lock.unlock() }; return transferredStorage.map(\.partURL.path)
+    }
     func expectation(forID id: Int) -> ExpectedFileIntegrity? {
         lock.lock(); defer { lock.unlock() }
         return transferredStorage.first { $0.id == id }?.expected
@@ -160,11 +164,11 @@ private final class FakeFirmwareServer: @unchecked Sendable {
     }
 
     /// Records the transfer and answers the id and bytes behind the request.
-    private func beginTransfer(_ request: URLRequest,
-                               _ expected: ExpectedFileIntegrity) -> (id: Int, payload: Data?)? {
+    private func beginTransfer(_ request: URLRequest, _ expected: ExpectedFileIntegrity,
+                               _ partURL: URL) -> (id: Int, payload: Data?)? {
         lock.lock(); defer { lock.unlock() }
         guard let id = idsByURL[request.url!.absoluteString] else { return nil }
-        transferredStorage.append((id, expected))
+        transferredStorage.append((id, expected, partURL))
         return (id, payloads[id])
     }
 
@@ -193,7 +197,9 @@ private final class FakeFirmwareServer: @unchecked Sendable {
     /// and a failed check removes the part file rather than leaving it.
     var transfer: PS1FileTransfer {
         { [self] request, partURL, expected, progress in
-            guard let begun = beginTransfer(request, expected) else { throw URLError(.badURL) }
+            guard let begun = beginTransfer(request, expected, partURL) else {
+                throw URLError(.badURL)
+            }
             if let hook = transferHook {
                 do { try await hook(begun.id, partURL) } catch {
                     try? FileManager.default.removeItem(at: partURL)
@@ -387,6 +393,22 @@ final class PS1FirmwareManagerTests: XCTestCase {
         }
     }
 
+    func testTheExclusionGuardOutranksTheRecognizedNameTable() {
+        // A catalogue that has had one of the excluded names added to it — the
+        // exact future edit `excludedFileNames` exists to catch. The guard, not
+        // the table, decides.
+        let trap = PS1BIOSCatalog(
+            byteCount: SyntheticBIOS.byteCount,
+            japan: SyntheticBIOS.catalog.japan,
+            usa: .init(fileName: "openbios.bin", md5: SyntheticBIOS.catalog.usa.md5),
+            europe: SyntheticBIOS.catalog.europe,
+            excludedFileNames: PS1BIOSCatalog.playStation.excludedFileNames)
+
+        XCTAssertNil(trap.entry(matching: "openbios.bin"))
+        XCTAssertNil(trap.entry(matching: "OPENBIOS.BIN"))
+        XCTAssertEqual(trap.entry(matching: "scph5500.bin"), trap.japan)
+    }
+
     func testCatalogMatchesRecognizedNamesIgnoringCase() {
         let catalog = PS1BIOSCatalog.playStation
         XCTAssertEqual(catalog.entry(matching: "SCPH5501.BIN"), catalog.usa)
@@ -413,8 +435,9 @@ final class PS1FirmwareManagerTests: XCTestCase {
         do {
             _ = try await manager.prepare(for: rom(regions: ["USA"]))
             XCTFail("expected the sentinel transfer failure")
-        } catch is SentinelError {
+        } catch let error as PS1FirmwareError {
             // The transfer was reached, which is the point: selection resolved.
+            assertSentinelFetchFailure(error, fileName: "scph5501.bin")
         }
         XCTAssertEqual(server.requestedNames, ["scph5501.bin"])
         XCTAssertEqual(server.requestedIDs, [102])
@@ -478,7 +501,7 @@ final class PS1FirmwareManagerTests: XCTestCase {
             _ = try await manager.prepare(for: rom(regions: ["USA"]))
             XCTFail("expected a missing-firmware failure")
         } catch let error as PS1FirmwareError {
-            XCTAssertEqual(error, .firmwareNotOnServer(fileName: "scph5501.bin"))
+            XCTAssertEqual(error, unavailable("scph5501.bin", .notOnServer))
         }
         XCTAssertEqual(server.requestedNames, [])
         XCTAssertEqual(server.transferredIDs, [])
@@ -498,7 +521,7 @@ final class PS1FirmwareManagerTests: XCTestCase {
             _ = try await manager.prepare(for: rom(regions: ["Europe"]))
             XCTFail("expected a missing-firmware failure")
         } catch let error as PS1FirmwareError {
-            XCTAssertEqual(error, .firmwareNotOnServer(fileName: "scph5502.bin"))
+            XCTAssertEqual(error, unavailable("scph5502.bin", .notOnServer))
         }
         XCTAssertEqual(server.requestedNames, [])
         XCTAssertEqual(server.transferredIDs, [])
@@ -514,8 +537,7 @@ final class PS1FirmwareManagerTests: XCTestCase {
                                       catalog: catalog)
 
         await assertPrepareFails(manager, regions: ["USA"],
-                                 with: .firmwareUnusable(fileName: "scph5501.bin",
-                                                         rejection: .missingFromStorage))
+                                 with: unavailable("scph5501.bin", .missingFromStorage))
         XCTAssertEqual(server.transferredIDs, [])
     }
 
@@ -528,8 +550,7 @@ final class PS1FirmwareManagerTests: XCTestCase {
                                       catalog: catalog)
 
         await assertPrepareFails(manager, regions: ["USA"],
-                                 with: .firmwareUnusable(fileName: "scph5501.bin",
-                                                         rejection: .unverified))
+                                 with: unavailable("scph5501.bin", .unverified))
         XCTAssertEqual(server.transferredIDs, [])
     }
 
@@ -541,10 +562,9 @@ final class PS1FirmwareManagerTests: XCTestCase {
                                       catalog: catalog)
 
         await assertPrepareFails(manager, regions: ["USA"],
-                                 with: .firmwareUnusable(
-                                    fileName: "scph5501.bin",
-                                    rejection: .wrongSize(byteCount: 262_144,
-                                                          expected: 524_288)))
+                                 with: unavailable("scph5501.bin",
+                                                   .wrongSize(byteCount: 262_144,
+                                                              expected: 524_288)))
         XCTAssertEqual(server.transferredIDs, [])
     }
 
@@ -557,10 +577,9 @@ final class PS1FirmwareManagerTests: XCTestCase {
                                       catalog: catalog)
 
         await assertPrepareFails(manager, regions: ["USA"],
-                                 with: .firmwareUnusable(
-                                    fileName: "scph5501.bin",
-                                    rejection: .declaredChecksumMismatch(
-                                        declared: catalog.europe.md5)))
+                                 with: unavailable("scph5501.bin",
+                                                   .declaredChecksumMismatch(
+                                                       declared: catalog.europe.md5)))
         XCTAssertEqual(server.transferredIDs, [])
     }
 
@@ -576,7 +595,9 @@ final class PS1FirmwareManagerTests: XCTestCase {
         do {
             _ = try await manager.prepare(for: rom(regions: ["USA"]))
             XCTFail("expected the sentinel transfer failure")
-        } catch is SentinelError {}
+        } catch let error as PS1FirmwareError {
+            assertSentinelFetchFailure(error)
+        }
         XCTAssertEqual(server.requestedIDs, [402])
     }
 
@@ -590,7 +611,7 @@ final class PS1FirmwareManagerTests: XCTestCase {
                                       catalog: catalog)
 
         await assertPrepareFails(manager, regions: ["USA"],
-                                 with: .firmwareNotOnServer(fileName: "scph5501.bin"))
+                                 with: unavailable("scph5501.bin", .notOnServer))
         XCTAssertEqual(server.requestedNames, [])
     }
 
@@ -610,7 +631,9 @@ final class PS1FirmwareManagerTests: XCTestCase {
         do {
             _ = try await manager.prepare(for: rom(regions: ["USA"]))
             XCTFail("expected the sentinel transfer failure")
-        } catch is SentinelError {}
+        } catch let error as PS1FirmwareError {
+            assertSentinelFetchFailure(error)
+        }
         let expected = try XCTUnwrap(server.expectation(forID: 402))
         XCTAssertEqual(expected.md5, catalog.usa.md5)
         XCTAssertEqual(expected.size, 524_288)
@@ -635,7 +658,9 @@ final class PS1FirmwareManagerTests: XCTestCase {
         do {
             _ = try await manager.prepare(for: rom(regions: ["USA"]))
             XCTFail("expected the sentinel transfer failure")
-        } catch is SentinelError {}
+        } catch let error as PS1FirmwareError {
+            assertSentinelFetchFailure(error)
+        }
         let expected = try XCTUnwrap(server.expectation(forID: 402))
         XCTAssertEqual(expected.md5, catalog.usa.md5)
         XCTAssertEqual(expected.sha1, sha1)
@@ -725,6 +750,24 @@ final class PS1FirmwareManagerTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: directory.path,
                                                      isDirectory: &isDirectory))
         XCTAssertTrue(isDirectory.boolValue)
+    }
+
+    func testThePublicInitializerUsesTheShippedCatalogue() async throws {
+        // Built through the seam initializer the app uses, which takes no
+        // catalogue: a 512-byte image is refused for being 512 bytes, which only
+        // `.playStation` says.
+        let server = FakeFirmwareServer()
+        server.add("scph5501.bin", id: 402)
+        let manager = try PS1FirmwareManager(cacheRoot: try tempDirectory(),
+                                             loadFirmware: server.loadFirmware,
+                                             buildRequest: server.buildRequest,
+                                             transfer: server.transfer)
+
+        await assertPrepareFails(manager, regions: ["USA"],
+                                 with: unavailable("scph5501.bin",
+                                                   .wrongSize(byteCount: 512,
+                                                              expected: 524_288)))
+        XCTAssertEqual(server.transferredIDs, [])
     }
 
     func testAClientBackedManagerOwnsTheSameSystemDirectory() async throws {
@@ -875,7 +918,7 @@ final class PS1FirmwareManagerTests: XCTestCase {
         let stamp = try XCTUnwrap(modificationDate(installed))
 
         await assertPrepareFails(manager, regions: ["World"],
-                                 with: .firmwareNotOnServer(fileName: "scph5502.bin"))
+                                 with: unavailable("scph5502.bin", .notOnServer))
 
         XCTAssertEqual(bytes(installed), SyntheticBIOS.usa)
         XCTAssertEqual(modificationDate(installed), stamp)
@@ -895,7 +938,9 @@ final class PS1FirmwareManagerTests: XCTestCase {
         do {
             _ = try await manager.prepare(for: rom(regions: ["World"]))
             XCTFail("expected the sentinel transfer failure")
-        } catch is SentinelError {}
+        } catch let error as PS1FirmwareError {
+            assertSentinelFetchFailure(error)
+        }
 
         XCTAssertEqual(bytes(installed), SyntheticBIOS.usa)
         XCTAssertEqual(modificationDate(installed), stamp)
@@ -915,10 +960,12 @@ final class PS1FirmwareManagerTests: XCTestCase {
         do {
             _ = try await manager.prepare(for: rom(regions: ["World"]))
             XCTFail("expected a digest mismatch")
-        } catch let error as FileIntegrityError {
-            guard case .digestMismatch = error else {
-                return XCTFail("unexpected integrity failure: \(error)")
+        } catch let error as PS1FirmwareError {
+            guard case let .fetchFailed(fileName, .integrity(integrity)) = error,
+                  case .digestMismatch = integrity else {
+                return XCTFail("unexpected failure: \(error)")
             }
+            XCTAssertEqual(fileName, "scph5502.bin")
         }
         // Whatever the server published, the checksum the transfer was told to
         // enforce is the standard image's.
@@ -977,36 +1024,185 @@ final class PS1FirmwareManagerTests: XCTestCase {
         XCTAssertEqual(modificationDate(installed), stamp)
     }
 
+    func testTwoConcurrentPreparationsBothInstallAValidImage() async throws {
+        let cacheRoot = try tempDirectory()
+        let server = liveShapedServer(SyntheticBIOS.catalog)
+        // Hold both transfers open at the same time. Actors are reentrant and
+        // `prepare` suspends at the firmware list and at every transfer, so two
+        // calls on one manager interleave; a part path shared between them would
+        // let the second truncate the first's bytes and leave one preparation
+        // renaming a file that is no longer there.
+        server.transferHook = { [server] _, _ in
+            var spins = 0
+            while server.transferredIDs.count < 2 && spins < 400 {
+                try? await Task.sleep(nanoseconds: 2_000_000)
+                spins += 1
+            }
+        }
+        let manager = try makeManager(cacheRoot: cacheRoot, server: server)
+        let subject = rom(regions: ["USA"])
+
+        async let first = manager.prepare(for: subject)
+        async let second = manager.prepare(for: subject)
+        let directories = try await [first, second]
+
+        XCTAssertEqual(server.transferredIDs, [102, 102],
+                       "both preparations must actually have run concurrently")
+        // The invariant that makes reentrancy a non-event: two transfers that are
+        // in flight at the same time never share a part path, so neither can
+        // truncate the other's bytes or rename a file the other already moved.
+        XCTAssertEqual(Set(server.partPaths).count, 2, "\(server.partPaths)")
+        XCTAssertTrue(server.partPaths.allSatisfy {
+            $0.hasPrefix(manager.systemDirectory.appendingPathComponent("scph5501.bin").path
+                         + ".part-")
+        }, "\(server.partPaths)")
+        XCTAssertEqual(Set(directories.map(\.path)), [manager.systemDirectory.path])
+        // Last writer wins, with bytes both preparations verified independently
+        // against the same standard checksum. No part file is left behind.
+        XCTAssertEqual(names(in: manager.systemDirectory), ["scph5501.bin"])
+        XCTAssertEqual(bytes(manager.systemDirectory.appendingPathComponent("scph5501.bin")),
+                       SyntheticBIOS.usa)
+    }
+
     // MARK: - Errors a player reads
 
     func testAMissingBIOSErrorNamesTheExactFileAndOffersRetry() {
-        let missing = PS1FirmwareError.firmwareNotOnServer(fileName: "scph5501.bin")
-        XCTAssertEqual(missing.fileName, "scph5501.bin")
-        XCTAssertTrue(missing.errorDescription?.contains("scph5501.bin") ?? false,
-                      "\(missing.errorDescription ?? "nil")")
-        XCTAssertTrue(missing.recoverySuggestion?.contains("scph5501.bin") ?? false,
-                      "\(missing.recoverySuggestion ?? "nil")")
-        XCTAssertTrue(missing.recoverySuggestion?.lowercased().contains("try again") ?? false,
-                      "\(missing.recoverySuggestion ?? "nil")")
-
         for rejection: PS1FirmwareError.Rejection in [
-            .missingFromStorage, .unverified, .wrongSize(byteCount: 1, expected: 524_288),
+            .notOnServer, .missingFromStorage, .unverified,
+            .wrongSize(byteCount: 1, expected: 524_288),
             .declaredChecksumMismatch(declared: String(repeating: "0", count: 32)),
         ] {
-            let error = PS1FirmwareError.firmwareUnusable(fileName: "scph5502.bin",
-                                                          rejection: rejection)
-            XCTAssertEqual(error.fileName, "scph5502.bin")
-            XCTAssertTrue(error.errorDescription?.contains("scph5502.bin") ?? false,
-                          "\(rejection)")
-            XCTAssertTrue(error.recoverySuggestion?.contains("scph5502.bin") ?? false,
-                          "\(rejection)")
+            let error = unavailable("scph5501.bin", rejection)
+            XCTAssertEqual(error.fileNames, ["scph5501.bin"])
+            XCTAssertTrue(error.errorDescription?.contains("scph5501.bin") ?? false,
+                          "\(rejection): \(error.errorDescription ?? "nil")")
+            XCTAssertTrue(error.recoverySuggestion?.contains("scph5501.bin") ?? false,
+                          "\(rejection): \(error.recoverySuggestion ?? "nil")")
             XCTAssertTrue(error.recoverySuggestion?.lowercased().contains("try again") ?? false,
                           "\(rejection)")
         }
 
+        let fetch = PS1FirmwareError.fetchFailed(
+            fileName: "scph5502.bin",
+            reason: .integrity(.digestMismatch(.sha1, expected: "a", actual: "b")))
+        XCTAssertEqual(fetch.fileNames, ["scph5502.bin"])
+        XCTAssertTrue(fetch.errorDescription?.contains("scph5502.bin") ?? false)
+        XCTAssertTrue(fetch.recoverySuggestion?.contains("scph5502.bin") ?? false)
+        XCTAssertTrue(fetch.recoverySuggestion?.lowercased().contains("try again") ?? false)
+
         let install = PS1FirmwareError.installFailed(fileName: "scph5500.bin", code: 21)
+        XCTAssertEqual(install.fileNames, ["scph5500.bin"])
         XCTAssertTrue(install.errorDescription?.contains("scph5500.bin") ?? false)
         XCTAssertTrue(install.recoverySuggestion?.lowercased().contains("try again") ?? false)
+    }
+
+    func testEveryUnresolvableImageIsNamedInOneError() async throws {
+        let server = FakeFirmwareServer()
+        // Only the American image is usable: the Japanese one is unverified and
+        // the European one is not published at all.
+        server.add("scph5500.bin", id: 101, verified: false)
+        server.add("scph5501.bin", id: 102)
+        let manager = try makeManager(cacheRoot: try tempDirectory(), server: server)
+
+        do {
+            _ = try await manager.prepare(for: rom(regions: ["World"]))
+            XCTFail("expected both refusals in one error")
+        } catch let error as PS1FirmwareError {
+            XCTAssertEqual(error, .firmwareUnavailable([
+                .init(fileName: "scph5500.bin", rejection: .unverified),
+                .init(fileName: "scph5502.bin", rejection: .notOnServer),
+            ]))
+            let sentence = try XCTUnwrap(error.errorDescription)
+            XCTAssertTrue(sentence.contains("scph5500.bin"), sentence)
+            XCTAssertTrue(sentence.contains("scph5502.bin"), sentence)
+            let retry = try XCTUnwrap(error.recoverySuggestion)
+            XCTAssertTrue(retry.contains("scph5500.bin and scph5502.bin"), retry)
+            XCTAssertTrue(retry.lowercased().contains("try again"), retry)
+        }
+        // Nothing was fetched: the whole set is resolved before the first byte.
+        XCTAssertEqual(server.transferredIDs, [])
+    }
+
+    func testATransferFailureNamesTheFileTheCoreIsWaitingFor() async throws {
+        let server = liveShapedServer(SyntheticBIOS.catalog)
+        // A well-formed SHA-1 that is not the payload's, alongside the right MD5:
+        // `rejection` only checks MD5, so this passes selection and fails on the
+        // bytes.
+        server.publish([RommFirmware(id: 102, fileName: "scph5501.bin",
+                                     fileSizeBytes: SyntheticBIOS.byteCount,
+                                     isVerified: true, crcHash: nil,
+                                     md5Hash: SyntheticBIOS.catalog.usa.md5,
+                                     sha1Hash: String(repeating: "a", count: 40),
+                                     missingFromFS: false,
+                                     updatedAt: "2026-02-03T04:05:06")])
+        let manager = try makeManager(cacheRoot: try tempDirectory(), server: server)
+
+        do {
+            _ = try await manager.prepare(for: rom(regions: ["USA"]))
+            XCTFail("expected a fetch failure")
+        } catch let error as PS1FirmwareError {
+            guard case let .fetchFailed(fileName, .integrity(integrity)) = error,
+                  case .digestMismatch(.sha1, _, _) = integrity else {
+                return XCTFail("unexpected failure: \(error)")
+            }
+            XCTAssertEqual(fileName, "scph5501.bin")
+            XCTAssertTrue(error.errorDescription?.contains("scph5501.bin") ?? false)
+            XCTAssertFalse(error.isLikelyConnectivityFailure)
+        }
+    }
+
+    func testAMalformedServerChecksumFailsNamingTheFile() async throws {
+        let server = FakeFirmwareServer()
+        // `""` rather than `null`: the server said something, and it is not a
+        // digest. It passes `rejection` (which only reads MD5) and is refused by
+        // `ExpectedFileIntegrity` before a byte moves.
+        server.publish([RommFirmware(id: 102, fileName: "scph5501.bin",
+                                     fileSizeBytes: SyntheticBIOS.byteCount,
+                                     isVerified: true, crcHash: nil,
+                                     md5Hash: SyntheticBIOS.catalog.usa.md5,
+                                     sha1Hash: "", missingFromFS: false,
+                                     updatedAt: "2026-02-03T04:05:06")])
+        let manager = try makeManager(cacheRoot: try tempDirectory(), server: server)
+
+        do {
+            _ = try await manager.prepare(for: rom(regions: ["USA"]))
+            XCTFail("expected a fetch failure")
+        } catch let error as PS1FirmwareError {
+            XCTAssertEqual(error, .fetchFailed(fileName: "scph5501.bin",
+                                               reason: .integrity(.malformedDigest(
+                                                   .sha1, problem: .empty))))
+            XCTAssertTrue(error.errorDescription?.contains("scph5501.bin") ?? false)
+        }
+        XCTAssertEqual(server.transferredIDs, [], "refused before the transfer")
+    }
+
+    func testANetworkFailureStaysClassifiableAsAConnectivityFailure() async throws {
+        let server = liveShapedServer(SyntheticBIOS.catalog)
+        server.transferHook = { _, _ in throw URLError(.notConnectedToInternet) }
+        let manager = try makeManager(cacheRoot: try tempDirectory(), server: server)
+
+        do {
+            _ = try await manager.prepare(for: rom(regions: ["USA"]))
+            XCTFail("expected a fetch failure")
+        } catch let error as PS1FirmwareError {
+            XCTAssertEqual(error, .fetchFailed(fileName: "scph5501.bin",
+                                               reason: .network(.notConnectedToInternet)))
+            XCTAssertTrue(error.isLikelyConnectivityFailure)
+        }
+    }
+
+    func testCancellationDuringATransferIsNotRewrittenAsAFetchFailure() async throws {
+        let server = liveShapedServer(SyntheticBIOS.catalog)
+        server.transferHook = { _, _ in throw CancellationError() }
+        let manager = try makeManager(cacheRoot: try tempDirectory(), server: server)
+
+        do {
+            _ = try await manager.prepare(for: rom(regions: ["USA"]))
+            XCTFail("expected cancellation")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("unexpected failure: \(error)")
+        }
     }
 
     // MARK: - Progress
@@ -1065,6 +1261,26 @@ final class PS1FirmwareManagerTests: XCTestCase {
     }
 
     // MARK: - Helpers
+
+    /// The single-image spelling of the aggregate refusal.
+    private func unavailable(_ fileName: String,
+                             _ rejection: PS1FirmwareError.Rejection) -> PS1FirmwareError {
+        .firmwareUnavailable([.init(fileName: fileName, rejection: rejection)])
+    }
+
+    /// A transfer-stage failure driven by `SentinelError`, which `install` rewrites
+    /// so that it names the file the core is waiting for.
+    private func assertSentinelFetchFailure(_ error: PS1FirmwareError,
+                                            fileName: String? = nil,
+                                            file: StaticString = #filePath,
+                                            line: UInt = #line) {
+        guard case let .fetchFailed(named, .other(text)) = error else {
+            return XCTFail("expected a wrapped transfer failure, got \(error)",
+                           file: file, line: line)
+        }
+        XCTAssertTrue(text.contains("SentinelError"), text, file: file, line: line)
+        if let fileName { XCTAssertEqual(named, fileName, file: file, line: line) }
+    }
 
     private func assertPrepareFails(_ manager: PS1FirmwareManager,
                                     regions: [String],

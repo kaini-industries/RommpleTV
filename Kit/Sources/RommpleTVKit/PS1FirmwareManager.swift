@@ -158,8 +158,11 @@ struct PS1BIOSCatalog: Sendable, Equatable {
 /// is not something a player can act on and "scph5501.bin is missing" is.
 public enum PS1FirmwareError: Error, Equatable, Sendable, LocalizedError {
 
-    /// Why the entry the server published under a recognized name is not usable.
+    /// Why one required image is not available from the server.
     public enum Rejection: Equatable, Sendable {
+        /// No entry with this name at all — including when the server carries an
+        /// alias with the right checksum under another name.
+        case notOnServer
         /// RomM has the record but not the file.
         case missingFromStorage
         /// RomM has not matched the file against a known-good hash.
@@ -170,41 +173,85 @@ public enum PS1FirmwareError: Error, Equatable, Sendable, LocalizedError {
         case declaredChecksumMismatch(declared: String)
     }
 
-    /// No entry with this name at all — including when the server carries an
-    /// alias with the right checksum under another name.
-    case firmwareNotOnServer(fileName: String)
-    case firmwareUnusable(fileName: String, rejection: Rejection)
+    /// One required image the server cannot supply, and why. Thrown on its own by
+    /// `select`, collected by `prepare`.
+    public struct Unavailable: Error, Equatable, Sendable {
+        public let fileName: String
+        public let rejection: Rejection
+
+        public init(fileName: String, rejection: Rejection) {
+            self.fileName = fileName
+            self.rejection = rejection
+        }
+    }
+
+    /// What went wrong while fetching one image, in a form that survives being
+    /// carried in an `Equatable` error. `network` keeps the `URLError.Code` so a
+    /// caller can still tell "you are offline" from "the server refused".
+    public enum FetchFailure: Equatable, Sendable {
+        case integrity(FileIntegrityError)
+        case network(URLError.Code)
+        case other(String)
+
+        init(_ error: Error) {
+            if let integrity = error as? FileIntegrityError {
+                self = .integrity(integrity)
+            } else if let urlError = error as? URLError {
+                self = .network(urlError.code)
+            } else {
+                self = .other(String(describing: error))
+            }
+        }
+    }
+
+    /// **Every** required image the server could not supply, in the order they
+    /// were needed — not just the first. A player who has to add two BIOS files
+    /// should make one trip to their server, not one trip per retry.
+    case firmwareUnavailable([Unavailable])
+    /// The image was selected but could not be fetched or did not check out.
+    case fetchFailed(fileName: String, reason: FetchFailure)
     /// The verified bytes could not be moved into place. `code` is the `errno`
     /// from `rename(2)`.
     case installFailed(fileName: String, code: Int32)
 
-    /// The core-recognized file name this failure is about.
-    public var fileName: String {
+    /// The core-recognized file names this failure is about.
+    public var fileNames: [String] {
         switch self {
-        case let .firmwareNotOnServer(fileName),
-             let .firmwareUnusable(fileName, _),
-             let .installFailed(fileName, _):
-            return fileName
+        case let .firmwareUnavailable(items):
+            return items.map(\.fileName)
+        case let .fetchFailed(fileName, _), let .installFailed(fileName, _):
+            return [fileName]
         }
+    }
+
+    /// Whether this failure means the device could not reach the server, decided
+    /// by the same rule `PS1PackageStore` uses so one screen classifies both.
+    public var isLikelyConnectivityFailure: Bool {
+        guard case let .fetchFailed(_, .network(code)) = self else { return false }
+        return PS1PackageStore.isLikelyConnectivityError(URLError(code))
     }
 
     public var errorDescription: String? {
         switch self {
-        case let .firmwareNotOnServer(fileName):
-            return "Your RomM server has no PlayStation BIOS file named \"\(fileName)\"."
-        case let .firmwareUnusable(fileName, rejection):
-            switch rejection {
-            case .missingFromStorage:
-                return "Your RomM server lists \"\(fileName)\" but its file is missing."
-            case .unverified:
-                return "The \"\(fileName)\" on your RomM server is not verified."
-            case let .wrongSize(byteCount, expected):
-                return "The \"\(fileName)\" on your RomM server is \(byteCount) bytes; "
-                    + "a PlayStation BIOS is \(expected) bytes."
-            case let .declaredChecksumMismatch(declared):
-                return "The \"\(fileName)\" on your RomM server has checksum \(declared), "
-                    + "which is not the standard \(fileName)."
+        case let .firmwareUnavailable(items):
+            let described = items.map { "\"\($0.fileName)\" (\(Self.phrase($0.rejection)))" }
+            guard described.count > 1 else {
+                return "Your RomM server cannot supply the PlayStation BIOS file "
+                    + "\(described.first ?? "")."
             }
+            return "Your RomM server cannot supply \(described.count) PlayStation BIOS files: "
+                + described.joined(separator: ", ") + "."
+        case let .fetchFailed(fileName, reason):
+            let detail: String
+            switch reason {
+            case let .integrity(error):
+                detail = error.errorDescription ?? String(describing: error)
+            case let .network(code):
+                detail = "The download failed (network error \(code.rawValue))."
+            case let .other(text):
+                detail = text
+            }
+            return "RommpleTV could not fetch \"\(fileName)\". \(detail)"
         case let .installFailed(fileName, code):
             return "RommpleTV could not save \"\(fileName)\" (error \(code))."
         }
@@ -212,12 +259,37 @@ public enum PS1FirmwareError: Error, Equatable, Sendable, LocalizedError {
 
     public var recoverySuggestion: String? {
         switch self {
-        case .firmwareNotOnServer, .firmwareUnusable:
-            return "Add a verified \(fileName) to your RomM server's PlayStation firmware, "
-                + "then try again."
+        case .firmwareUnavailable:
+            return "Add verified copies of \(Self.list(fileNames)) to your RomM server's "
+                + "PlayStation firmware, then try again."
+        case .fetchFailed:
+            return "Check your connection to your RomM server, then try again to get "
+                + "\(Self.list(fileNames))."
         case .installFailed:
-            return "Check that RommpleTV has room for \(fileName), then try again."
+            return "Check that RommpleTV has room for \(Self.list(fileNames)), then try again."
         }
+    }
+
+    private static func phrase(_ rejection: Rejection) -> String {
+        switch rejection {
+        case .notOnServer:
+            return "there is no file with that name"
+        case .missingFromStorage:
+            return "its file is missing from storage"
+        case .unverified:
+            return "it is not verified"
+        case let .wrongSize(byteCount, expected):
+            return "it is \(byteCount) bytes rather than \(expected)"
+        case let .declaredChecksumMismatch(declared):
+            return "its checksum \(declared) is not the standard one"
+        }
+    }
+
+    /// `"a"`, `"a and b"`, `"a, b and c"` — a sentence, not a debug dump.
+    private static func list(_ names: [String]) -> String {
+        guard let last = names.last else { return "" }
+        guard names.count > 1 else { return last }
+        return names.dropLast().joined(separator: ", ") + " and " + last
     }
 }
 
@@ -230,7 +302,7 @@ public enum PS1FirmwareError: Error, Equatable, Sendable, LocalizedError {
 ///   scph5500.bin
 ///   scph5501.bin
 ///   scph5502.bin
-///   scph550x.bin.part   (only while a transfer is in flight)
+///   scph550x.bin.part-<uuid>   (only while a transfer is in flight)
 /// ```
 ///
 /// The property everything else is arranged around: **a failure never costs a
@@ -247,8 +319,16 @@ public enum PS1FirmwareError: Error, Equatable, Sendable, LocalizedError {
 /// list call, a content request or a HEAD when every required image is already
 /// there. An Apple TV with the BIOS cached can start a game with the server off.
 ///
-/// One manager per cache root: two live managers over one root would race on the
-/// same part paths. Within one manager the actor serializes preparations.
+/// **Concurrent preparations do not need to be prevented, and are not.** The
+/// actor protects this type's own state; it does *not* serialize `prepare`
+/// against itself. Actors are reentrant and isolation is released at every
+/// `await`, of which `prepare` has two (the firmware list, and each transfer), so
+/// two calls on one instance interleave — as do two managers over one cache root.
+/// What makes that safe is that they share no mutable filesystem state: each
+/// transfer writes to its own `part-<uuid>` path, so neither can truncate the
+/// other's bytes, and each install is an atomic `rename(2)`. Both verify
+/// independently against the same standard MD5, both installs succeed, and the
+/// last writer wins with an image that is by definition the same bytes.
 public actor PS1FirmwareManager {
 
     /// `Caches/ps1/system`, the directory handed to `LibretroCore`.
@@ -359,10 +439,20 @@ public actor PS1FirmwareManager {
 
         // Step 3 — one usable row per missing image, chosen by recognized name.
         // Every selection happens before the first transfer, so a set that cannot
-        // be completed costs no bandwidth and installs nothing.
+        // be completed costs no bandwidth and installs nothing — and every image
+        // that cannot be resolved is named in the one error, so the player fixes
+        // their server once instead of once per retry.
         var selections: [(entry: PS1BIOSCatalog.Entry, firmware: RommFirmware)] = []
+        var unavailable: [PS1FirmwareError.Unavailable] = []
         for entry in missing {
-            selections.append((entry, try select(entry, from: published)))
+            do {
+                selections.append((entry, try select(entry, from: published)))
+            } catch let refusal as PS1FirmwareError.Unavailable {
+                unavailable.append(refusal)
+            }
+        }
+        guard unavailable.isEmpty else {
+            throw PS1FirmwareError.firmwareUnavailable(unavailable)
         }
 
         // Step 4 — transfer, verify, install. One file at a time: each one that
@@ -449,15 +539,15 @@ public actor PS1FirmwareManager {
                 return left.id < right.id
             }
         guard let first = candidates.first else {
-            throw PS1FirmwareError.firmwareNotOnServer(fileName: entry.fileName)
+            throw PS1FirmwareError.Unavailable(fileName: entry.fileName, rejection: .notOnServer)
         }
         if let usable = candidates.first(where: { rejection(of: $0, as: entry) == nil }) {
             return usable
         }
         // Every candidate failed. Report the front-runner's reason, which is the
         // one the player would otherwise have to guess at.
-        throw PS1FirmwareError.firmwareUnusable(fileName: entry.fileName,
-                                                rejection: rejection(of: first, as: entry)!)
+        throw PS1FirmwareError.Unavailable(fileName: entry.fileName,
+                                           rejection: rejection(of: first, as: entry)!)
     }
 
     /// The single rule this row breaks, in a fixed order so a failure is
@@ -481,30 +571,54 @@ public actor PS1FirmwareManager {
 
     // MARK: - Transfer and install
 
-    /// Streams one image to `<name>.part` and renames it into place.
+    /// Streams one image to its own `part-<uuid>` file and renames it into place.
+    ///
+    /// Everything the transfer stage can throw is rewritten to carry
+    /// `entry.fileName`. A `digestMismatch` on a SHA-1 the server published, or a
+    /// `malformedDigest` from a row whose `sha1_hash` is `""` rather than absent,
+    /// are both reachable and neither names a file on its own; a player told "the
+    /// download's SHA-1 is wrong" cannot act, and one told "scph5501.bin did not
+    /// check out" can. Cancellation is the exception and is never rewritten: it is
+    /// a decision, not a failure, and a caller distinguishes it by type.
     private func install(_ firmware: RommFirmware,
                          as entry: PS1BIOSCatalog.Entry,
                          reporter: PS1TransferProgress) async throws {
-        // The standard MD5 rather than the server's: they have already been
-        // checked to agree when the server supplied one, and a server that
-        // supplies none must not be able to skip the check. The size is the
-        // catalogue's for the same reason. Every other hash the server did
-        // supply is checked too — one it sent and we ignored is a corruption we
-        // chose not to catch.
-        let expected = try ExpectedFileIntegrity(size: catalog.byteCount,
-                                                 sha1: firmware.sha1Hash,
-                                                 md5: entry.md5,
-                                                 crc32: firmware.crcHash)
-        let destination = url(for: entry)
-        let partURL = destination.appendingPathExtension("part")
-        let request = buildRequest(firmware.id, firmware.fileName)
-        // The digest the transfer returns provably describes the bytes at the
-        // part path (Task 5 pinned that), so the file is installed without being
-        // read a second time.
-        _ = try await transfer(request, partURL, expected) { written in
-            reporter.update(written)
+        do {
+            // The standard MD5 rather than the server's: they have already been
+            // checked to agree when the server supplied one, and a server that
+            // supplies none must not be able to skip the check. The size is the
+            // catalogue's for the same reason. Every other hash the server did
+            // supply is checked too — one it sent and we ignored is a corruption
+            // we chose not to catch.
+            let expected = try ExpectedFileIntegrity(size: catalog.byteCount,
+                                                     sha1: firmware.sha1Hash,
+                                                     md5: entry.md5,
+                                                     crc32: firmware.crcHash)
+            let destination = url(for: entry)
+            // Unique per attempt. Two preparations that both want this image run
+            // concurrently — the actor does not stop them — and a shared part
+            // path would let the second `createPartFile` truncate the first's
+            // bytes while its file descriptor kept writing past the end, so both
+            // could verify their own in-memory digest over a file that is
+            // neither. Uniqueness is what makes reentrancy a non-event.
+            let partURL = destination.appendingPathExtension("part-\(UUID().uuidString)")
+            let request = buildRequest(firmware.id, firmware.fileName)
+            // The digest the transfer returns provably describes the bytes at the
+            // part path (Task 5 pinned that), so the file is installed without
+            // being read a second time.
+            _ = try await transfer(request, partURL, expected) { written in
+                reporter.update(written)
+            }
+            try Self.install(partURL, at: destination, named: entry.fileName)
+        } catch let error as PS1FirmwareError {
+            throw error                 // `installFailed` already names the file.
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            if Task.isCancelled { throw CancellationError() }
+            throw PS1FirmwareError.fetchFailed(fileName: entry.fileName,
+                                               reason: .init(error))
         }
-        try Self.install(partURL, at: destination, named: entry.fileName)
     }
 
     /// Moves a verified image onto its final name.
@@ -518,8 +632,12 @@ public actor PS1FirmwareManager {
     /// there is replaced rather than written through.
     ///
     /// A failure here leaves the verified bytes at the part path. They are not
-    /// deleted, for the same reason nothing else here is: the next attempt
-    /// truncates that file anyway, and a `.part` is never mistaken for a BIOS.
+    /// deleted, for the same reason nothing else here is — removing anything from
+    /// this directory is the operation this file refuses to contain. Since part
+    /// paths are now unique per attempt, that costs one 512 KB file per failed
+    /// install rather than one in total; it is bounded by the number of installs a
+    /// player retries, it sits in a purgeable Caches directory, and a `part-`
+    /// suffix is never a name the core loads.
     static func install(_ partURL: URL, at destination: URL, named fileName: String) throws {
         let code: Int32 = partURL.withUnsafeFileSystemRepresentation { source in
             destination.withUnsafeFileSystemRepresentation { target in
