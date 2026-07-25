@@ -175,6 +175,15 @@ final class CueSheetTests: XCTestCase {
                       .malformedDirective(line: 1, problem: .trailingJunk))
     }
 
+    /// Both shapes are refused; the file-type token decides which sentence the
+    /// player is shown.
+    func testTrailingJunkAfterUnquotedNameIsNamedAccurately() {
+        assertRejects("FILE track01.bin BINARY EXTRA\n",
+                      .malformedDirective(line: 1, problem: .trailingJunk))
+        assertRejects("FILE track 01.bin BINARY\n",
+                      .malformedDirective(line: 1, problem: .unquotedNameWithSpaces))
+    }
+
     func testFileTypeMayBeOmitted() throws {
         XCTAssertEqual(try CueSheet.parse("FILE \"track01.bin\"\n").fileReferences,
                        ["track01.bin"])
@@ -207,6 +216,10 @@ final class CueSheetTests: XCTestCase {
         XCTAssertEqual(try CueSheet.parse(text).fileReferences, ["caf\u{00E9} track.bin"])
     }
 
+    /// A guard on Foundation's behaviour, not on this file's: `String(data:
+    /// encoding: .utf8)` strips a leading BOM itself, so this test passes with or
+    /// without the byte-level strip in `decode`. That is exactly why it gave false
+    /// confidence on its own — the test below is the one that bites.
     func testStripsUTF8ByteOrderMark() throws {
         var data = Data([0xEF, 0xBB, 0xBF])
         data.append(Data("FILE \"track01.bin\" BINARY\n".utf8))
@@ -398,6 +411,18 @@ final class CueSheetTests: XCTestCase {
         assertRejectsReference(deep + "/track01.bin", .pathTooLong)
     }
 
+    /// The cap is half of Darwin's `PATH_MAX`, so what it lets through still has
+    /// room for the cache root it will be joined to. Pinned at the boundary so it
+    /// cannot drift back up to 1024, where a passing reference can still fail with
+    /// `ENAMETOOLONG`.
+    func testPathLengthCapSitsWhereItIsDocumented() {
+        let fits = String(repeating: "a", count: 250) + "/"
+            + String(repeating: "b", count: 250) + "/abcdef.bin"
+        XCTAssertEqual(fits.utf8.count, CuePath.maximumPathByteCount)
+        assertAccepts(fits)
+        assertRejectsReference("a" + fits, .pathTooLong)
+    }
+
     // MARK: - Referenced extensions
 
     func testSupportedExtensionsAreAccepted() throws {
@@ -405,11 +430,25 @@ final class CueSheetTests: XCTestCase {
         FILE "track01.bin" BINARY
         FILE "TRACK02.BIN" BINARY
         FILE "sidecar.sbi" BINARY
-        FILE "Vault Runner.Cue" BINARY
 
         """
         XCTAssertEqual(try CueSheet.parse(text).fileReferences,
-                       ["track01.bin", "TRACK02.BIN", "sidecar.sbi", "Vault Runner.Cue"])
+                       ["track01.bin", "TRACK02.BIN", "sidecar.sbi"])
+    }
+
+    /// A cue sheet references tracks, never another cue sheet. Accepting `.cue`
+    /// would let a sheet name *itself*: the reference resolves to the cue's own
+    /// `RomFile` and its destination is the cue's own path, so staging would write
+    /// a download over the file being read. Exact self-reference is the variant
+    /// that bites on tvOS (case-sensitive APFS); the case-folded one bites on the
+    /// simulator and on macOS. Refusing the extension removes both.
+    func testCueReferencesAreRejectedIncludingSelfReference() {
+        assertRejects(cue("Vault Runner.cue"),
+                      .unsupportedTrackExtension("Vault Runner.cue", fileExtension: "cue"))
+        assertRejects(cue("VAULT RUNNER.CUE"),
+                      .unsupportedTrackExtension("VAULT RUNNER.CUE", fileExtension: "CUE"))
+        assertRejects(cue("Vault Runner.Cue"),
+                      .unsupportedTrackExtension("Vault Runner.Cue", fileExtension: "Cue"))
     }
 
     func testUnsupportedExtensionsAreRejected() {
@@ -663,16 +702,19 @@ final class CueSheetTests: XCTestCase {
     }
 
     /// The M3U's paths come from server-supplied names too, so the writer applies
-    /// the same validation instead of trusting its caller.
-    func testM3UOmitsUnsafePaths() {
-        let data = M3UWriter.data(cuePaths: ["../escape.cue",
-                                             "/absolute.cue",
-                                             "#EXTM3U",
-                                             "line\nbreak.cue",
-                                             "~/home.cue",
-                                             "",
-                                             "Disc 1/Vault Runner (Disc 1).cue"])
-        XCTAssertEqual(data, Data("Disc 1/Vault Runner (Disc 1).cue\n".utf8))
+    /// the same validation instead of trusting its caller — and one bad entry
+    /// voids the whole playlist. Writing the survivors would renumber the discs:
+    /// disc 3 becomes disc 2 in the swap overlay and every later index is wrong,
+    /// with nothing to notice. An empty playlist is a failure the caller can see.
+    func testM3UIsEmptyWhenAnyPathIsUnsafe() {
+        let good = "Disc 1/Vault Runner (Disc 1).cue"
+        let later = "Disc 3/Vault Runner (Disc 3).cue"
+        for bad in ["../escape.cue", "/absolute.cue", "#EXTM3U", "line\nbreak.cue",
+                    "~/home.cue", "", "Disc 2/Vault Runner (Disc 2).bin"] {
+            XCTAssertEqual(M3UWriter.data(cuePaths: [good, bad, later]), Data(), bad)
+        }
+        XCTAssertEqual(M3UWriter.data(cuePaths: [good, later]),
+                       Data("\(good)\n\(later)\n".utf8))
     }
 
     func testM3UOfNothingIsEmpty() {
@@ -709,11 +751,18 @@ final class CueSheetTests: XCTestCase {
                                .unsafeReference(path, rejection: rejection), path)
             }
         }
-        XCTAssertThrowsError(try CueStaging.prepareDestination(for: "track01.exe", in: root)) {
-            XCTAssertEqual($0 as? CueSheetError,
-                           .unsupportedTrackExtension("track01.exe", fileExtension: "exe"))
-        }
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), [])
+    }
+
+    /// Staging judges path safety, not what the file is called: RommpleTV writes
+    /// the disc's own `.cue` and the generated `.m3u` through this same function,
+    /// so the track-extension whitelist belongs to `CueSheet.parse` instead.
+    func testStagingDoesNotApplyTheTrackExtensionWhitelist() throws {
+        let root = try tempDirectory()
+        for path in ["Vault Runner (Disc 1).cue", "Vault Runner.m3u"] {
+            XCTAssertEqual(try CueStaging.prepareDestination(for: path, in: root).lastPathComponent,
+                           path)
+        }
     }
 
     /// A symlink already sitting in the staging tree would move the write outside
@@ -749,6 +798,44 @@ final class CueSheetTests: XCTestCase {
             XCTAssertEqual(error as? CueSheetError, .destinationBlockedBySymlink("track01.bin"))
         }
         XCTAssertEqual(try Data(contentsOf: victim), Data("victim".utf8))
+    }
+
+    /// Staging directories outlive a run, so the destination itself needs the same
+    /// three-way check as every component before it: a directory left there by an
+    /// earlier cue is not a write target, it is `EISDIR` in the downloader.
+    func testStagingRefusesADirectoryAtTheDestination() throws {
+        let root = try tempDirectory()
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("track01.bin"),
+                                                withIntermediateDirectories: true)
+        XCTAssertThrowsError(try CueStaging.prepareDestination(for: "track01.bin",
+                                                              in: root)) { error in
+            XCTAssertEqual(error as? CueSheetError,
+                           .destinationIsNotARegularFile("track01.bin"))
+        }
+    }
+
+    /// The sequence that makes the previous test reachable without a symlink and
+    /// without a within-sheet collision: one cue's nested reference leaves a
+    /// directory behind, and the next cue — or RommpleTV staging the disc's own
+    /// `.cue` — asks for a file of that name.
+    func testDirectoryLeftByAnEarlierReferenceBlocksALaterFile() throws {
+        let root = try tempDirectory()
+        _ = try CueStaging.prepareDestination(for: "Vault Runner.cue/track01.bin", in: root)
+        XCTAssertThrowsError(try CueStaging.prepareDestination(for: "Vault Runner.cue",
+                                                              in: root)) { error in
+            XCTAssertEqual(error as? CueSheetError,
+                           .destinationIsNotARegularFile("Vault Runner.cue"))
+        }
+    }
+
+    /// The ordinary re-download case: an existing file is a target, not a blocker.
+    func testStagingAllowsReplacingAnExistingFile() throws {
+        let root = try tempDirectory()
+        let existing = root.appendingPathComponent("track01.bin")
+        try Data("stale".utf8).write(to: existing)
+        XCTAssertEqual(try CueStaging.prepareDestination(for: "track01.bin", in: root), existing)
+        XCTAssertEqual(try Data(contentsOf: existing), Data("stale".utf8),
+                       "staging must not touch the bytes")
     }
 
     func testStagingRefusesAFileWhereADirectoryIsNeeded() throws {

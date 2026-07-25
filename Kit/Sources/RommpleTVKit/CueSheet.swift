@@ -5,7 +5,7 @@ import Foundation
 /// Every way a cue sheet can be refused. The cases are deliberately fine-grained:
 /// each one names the single rule that fired, so a caller can explain the failure
 /// to someone sitting on a couch, and a test can pin one rule at a time.
-public enum CueSheetError: Error, Equatable, LocalizedError {
+public enum CueSheetError: Error, Equatable, Sendable, LocalizedError {
 
     /// Why one `FILE` reference is not a safe relative path.
     public enum Rejection: String, Sendable {
@@ -58,6 +58,7 @@ public enum CueSheetError: Error, Equatable, LocalizedError {
     case destinationEscapesStagingDirectory(String)
     case destinationBlockedBySymlink(String)
     case destinationBlockedByFile(String)
+    case destinationIsNotARegularFile(String)
 
     public var errorDescription: String? {
         switch self {
@@ -131,6 +132,9 @@ public enum CueSheetError: Error, Equatable, LocalizedError {
                 + "RommpleTV will not write through it."
         case let .destinationBlockedByFile(component):
             return "\"\(component)\" in this disc's folder is a file where a folder is needed."
+        case let .destinationIsNotARegularFile(component):
+            return "\"\(component)\" in this disc's folder is a folder, or something other "
+                + "than a file, where a track file has to go."
         }
     }
 }
@@ -149,13 +153,34 @@ enum CuePath {
     /// APFS/HFS+ name limit. A longer component fails at write time with a
     /// cryptic errno; refusing it here produces a sentence a player can read.
     static let maximumComponentByteCount = 255
-    /// Darwin's `PATH_MAX` minus room for the cache root.
-    static let maximumPathByteCount = 1024
-    /// Phase 2 stages cue/bin discs plus an optional SBI sidecar. Anything else a
-    /// cue names is not a track this build can play.
-    static let allowedExtensions: Set<String> = ["bin", "cue", "sbi"]
+    /// Half of Darwin's `PATH_MAX` (1024, NUL included). The other half is the
+    /// budget for what this path hangs off: the app container's Caches directory
+    /// plus this disc's staging folder. A cap *at* `PATH_MAX` would let a
+    /// reference through that still fails with `ENAMETOOLONG` once joined.
+    static let maximumPathByteCount = 512
+    /// What a `FILE` line may name. A cue sheet references its tracks; it never
+    /// references another cue sheet, and staging one would put a download on top
+    /// of the disc's own cue. The `.cue` and `.m3u` files RommpleTV writes itself
+    /// go through `validate` without this check — see `CueStaging`.
+    static let allowedTrackExtensions: Set<String> = ["bin", "sbi"]
+
+    /// The safe relative spelling of a `FILE` reference, which must additionally
+    /// name a track this build can play.
+    static func validateTrackReference(_ reference: String) throws -> String {
+        let path = try validate(reference)
+        let name = String(path.split(separator: "/").last ?? "")
+        let fileExtension = self.fileExtension(of: name)
+        guard allowedTrackExtensions.contains(fileExtension.lowercased()) else {
+            throw CueSheetError.unsupportedTrackExtension(reference, fileExtension: fileExtension)
+        }
+        return path
+    }
 
     /// The safe relative spelling of `reference`, or a throw naming the rule.
+    ///
+    /// Path safety only: what the file at the end of it may be called is a
+    /// separate question, asked by `validateTrackReference` of cue references and
+    /// by `M3UWriter` of playlist entries, because the answer differs.
     ///
     /// Separators are normalized (`\` → `/`) *before* the component rules run, so
     /// `a\..\..\b` is judged as `a/../../b` rather than sailing through as one
@@ -222,11 +247,6 @@ enum CuePath {
             }
         }
 
-        guard let name = components.last else { throw reject(.empty) }
-        let fileExtension = self.fileExtension(of: name)
-        guard allowedExtensions.contains(fileExtension.lowercased()) else {
-            throw CueSheetError.unsupportedTrackExtension(reference, fileExtension: fileExtension)
-        }
         return components.joined(separator: "/")
     }
 
@@ -329,7 +349,7 @@ public struct CueSheet: Sendable {
         var directoriesByFoldedPath: [String: String] = [:]
 
         for operand in operands {
-            let path = try CuePath.validate(operand)
+            let path = try CuePath.validateTrackReference(operand)
             // Two spellings that normalize to the same bytes name the same file at
             // the same place: one download, not a conflict.
             guard seenBytes.insert(Array(path.utf8)).inserted else { continue }
@@ -393,6 +413,10 @@ public struct CueSheet: Sendable {
             .map(String.init)
     }
 
+    /// The file-type tokens the cue format defines. Used only to word the error
+    /// for a malformed unquoted directive; no directive is accepted because of it.
+    private static let fileTypes: Set<String> = ["binary", "motorola", "aiff", "wave", "mp3"]
+
     /// The operand of a `FILE` directive, or `nil` when the line is not one.
     private static func fileOperand(in line: String, number: Int) throws -> String? {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -420,11 +444,16 @@ public struct CueSheet: Sendable {
 
         // Unquoted: the name is one word. The cue format requires quotes around a
         // name with spaces, and guessing where such a name ends is how a validator
-        // starts interpreting.
+        // starts interpreting. Both shapes below are refused; the file-type token
+        // only decides which sentence the player is shown — `x.bin BINARY EXTRA`
+        // is junk after a complete directive, `track 01.bin BINARY` is a name that
+        // needed quotes.
         let tokens = remainder.split(whereSeparator: { $0.isWhitespace })
-        guard tokens.count <= 2 else {
-            throw CueSheetError.malformedDirective(line: number,
-                                                   problem: .unquotedNameWithSpaces)
+        if tokens.count > 2 {
+            let problem: CueSheetError.DirectiveProblem =
+                Self.fileTypes.contains(tokens[1].lowercased()) ? .trailingJunk
+                                                                : .unquotedNameWithSpaces
+            throw CueSheetError.malformedDirective(line: number, problem: problem)
         }
         return String(tokens[0])
     }
@@ -522,16 +551,27 @@ private struct DiscFileIndex {
 /// Writes the playlist that tells the core which cue sheets are the discs of one
 /// game, in order.
 public enum M3UWriter {
-    /// One relative cue path per line, LF-terminated, UTF-8, no BOM, sheet order
+    /// One relative cue path per line, LF-terminated, UTF-8, no BOM, disc order
     /// preserved.
     ///
     /// The paths are validated again here rather than trusted: they are built from
-    /// server-supplied names too, and a line the emulator would read as a directive
-    /// or as a path outside the game folder is dropped rather than written. An
-    /// omitted disc is a game that boots missing a disc; a smuggled line is a game
-    /// that reads a file nobody chose.
+    /// server-supplied names too, and a line the core would read as a directive or
+    /// as a path outside the game folder must never be written.
+    ///
+    /// Validation is **all or nothing**. Dropping one bad entry from a three-disc
+    /// game does not produce a playlist with a problem in it, it produces a
+    /// *wrong* playlist: disc 3 silently becomes disc 2 and every index the player
+    /// sees afterwards is off by one. An empty playlist is a failure the caller
+    /// can see; a short one is a wrong answer nobody notices.
     public static func data(cuePaths: [String]) -> Data {
-        let safe = cuePaths.compactMap { try? CuePath.validate($0) }
+        var safe: [String] = []
+        for path in cuePaths {
+            guard let normalized = try? CuePath.validate(path),
+                  let name = normalized.split(separator: "/").last,
+                  CuePath.fileExtension(of: String(name)).lowercased() == "cue"
+            else { return Data() }
+            safe.append(normalized)
+        }
         guard !safe.isEmpty else { return Data() }
         return Data(safe.map { $0 + "\n" }.joined().utf8)
     }
@@ -550,6 +590,10 @@ public enum CueStaging {
     /// are created one component at a time so that an existing symlink or file is
     /// found *before* anything is created through it; `withIntermediateDirectories`
     /// would happily follow a symlink out of the disc folder.
+    ///
+    /// Path safety only: the track-extension whitelist deliberately does not apply,
+    /// because the disc's own `.cue` and the generated `.m3u` are staged through
+    /// this same function. What a cue may *reference* is decided in `CueSheet.parse`.
     @discardableResult
     public static func prepareDestination(for relativePath: String,
                                           in stagingDirectory: URL) throws -> URL {
@@ -576,10 +620,20 @@ public enum CueStaging {
             }
         }
 
+        // The destination gets the same three-way check as every component before
+        // it. Replacing a regular file is the ordinary re-download case; anything
+        // else there is a write that cannot happen. Staging directories outlive a
+        // run, so a directory left by an earlier cue that referenced
+        // `x.bin/y.bin` is waiting for a later cue that references `x.bin`.
         let name = components[components.count - 1]
         url.appendPathComponent(name, isDirectory: false)
-        if itemType(at: url) == .typeSymbolicLink {
+        switch itemType(at: url) {
+        case .none, .some(.typeRegular):
+            break
+        case .some(.typeSymbolicLink):
             throw CueSheetError.destinationBlockedBySymlink(name)
+        case .some:
+            throw CueSheetError.destinationIsNotARegularFile(name)
         }
 
         // Backstop. The component walk above already refuses every way this can be
