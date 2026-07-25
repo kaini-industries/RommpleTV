@@ -564,14 +564,17 @@ public actor PS1PackageStore {
     /// The backup is removed only after the new package is in place.
     ///
     /// - Important: **This function must never become `async`, and no `await` may
-    ///   appear between the staged-cue re-parse and the second rename below.** The
-    ///   actor yields at every suspension point, so a suspension anywhere in this
-    ///   sequence lets a second `prepare` for the same game interleave against one
-    ///   canonical path — one promotion's backup rename landing between another's
-    ///   backup and install. That two concurrent preparations cannot damage a
-    ///   package is a consequence of this function being synchronous, not of the
-    ///   actor; `testConcurrentPreparesForOneGameLeaveOneValidPackage` covers the
-    ///   behaviour but no test can catch the day someone adds an `await` here.
+    ///   appear between the two renames below.** The actor yields at every
+    ///   suspension point, so a suspension inside this sequence lets a second
+    ///   `prepare` for the same game interleave against one canonical path — one
+    ///   promotion's backup rename landing between another's backup and install.
+    ///   That two concurrent preparations cannot damage a package is a consequence
+    ///   of this function being synchronous, not of the actor.
+    ///   `testConcurrentPreparesForOneGameLeaveOneValidPackage` drives both
+    ///   entrants through the backup branch, so an inserted `await` is *likely* to
+    ///   surface there as a `packageDamaged` throw and a leaked backup — but the
+    ///   probe seam is synchronous and cannot inject the suspension itself, so no
+    ///   test can catch it deterministically.
     private func promote(staging: URL, to canonical: URL, canonicalRomID: Int) throws {
         let manager = FileManager.default
         try promotionProbe?(.beforeBackup)
@@ -1148,7 +1151,7 @@ public actor PS1PackageStore {
     /// Lowercase, two characters per byte, no leading zero suppression — the same
     /// spelling `IncrementalFileDigest` produces, because these two strings are
     /// compared against each other.
-    static func hexadecimal<Bytes: Sequence>(_ bytes: Bytes) -> String
+    private static func hexadecimal<Bytes: Sequence>(_ bytes: Bytes) -> String
     where Bytes.Element == UInt8 {
         var characters: [UInt8] = []
         characters.reserveCapacity(40)

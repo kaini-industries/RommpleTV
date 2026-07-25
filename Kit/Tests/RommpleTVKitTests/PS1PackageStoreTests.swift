@@ -692,6 +692,23 @@ final class PS1PackageStoreTests: XCTestCase {
         let cacheRoot = try tempDirectory()
         let library = twoDiscLibrary()
         let store = try makeStore(cacheRoot: cacheRoot, library: library)
+
+        // Install first, then move the metadata on, so both entrants below rebuild
+        // over an existing package and both take promotion's *backup* branch.
+        // Against an empty cache root the first entrant returns from inside
+        // `promote`'s no-canonical guard after a single rename, so only the second
+        // can ever reach the backup branch — and the window this test exists for,
+        // one promotion's backup rename landing between another's backup and
+        // install, is unreachable however the two are scheduled.
+        _ = try await store.prepare(twoDiscGame())
+        let track = library.file(named: "Vault Runner (Disc 1) (Track 1).bin", in: 8300)
+        library.replaceFile(romID: 8300, fileID: track.id) { row in
+            RomFile(id: row.id, fileName: row.fileName, filePath: row.filePath,
+                    sizeBytes: row.sizeBytes, isTopLevel: row.isTopLevel, crcHash: row.crcHash,
+                    md5Hash: row.md5Hash, sha1Hash: row.sha1Hash,
+                    updatedAt: "2026-10-10T10:10:10")
+        }
+        library.resetCounters()
         // Yielding inside every transfer makes the two runs interleave at the
         // actor's suspension points instead of running end to end. What keeps the
         // canonical path safe is that `promote` has none — see its doc comment.
@@ -703,6 +720,10 @@ final class PS1PackageStoreTests: XCTestCase {
         async let second = store.prepare(twoDiscGame())
         let (a, b) = try await (first, second)
 
+        // Each entrant reaches its first `await` — the metadata load — before the
+        // other can promote, so both see the stale package and both rebuild. That
+        // is what puts two tasks in the backup branch.
+        XCTAssertEqual(library.transferCount, 12, "both runs must rebuild all six files")
         XCTAssertEqual(a.launchURL, b.launchURL)
         XCTAssertEqual(a.totalBytes, b.totalBytes)
         let root = platformRoot(in: cacheRoot)
