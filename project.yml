@@ -33,6 +33,10 @@ targets:
         embed: true
         codeSign: true
         link: false
+      - framework: Cores/tvos/mednafen_psx_libretro_tvos.dylib
+        embed: true
+        codeSign: true
+        link: false
     # PRODUCT_BUNDLE_IDENTIFIER, DEVELOPMENT_TEAM and CODE_SIGN_STYLE live in
     # the xcconfig, not in `settings` below — target settings would override the
     # xcconfig and defeat the untracked Config/Local.xcconfig override.
@@ -51,3 +55,38 @@ targets:
         NSLocalNetworkUsageDescription: "RommpleTV talks to your RomM server on the local network."
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
+  # Deterministic UI coverage for the launch-preparation screen. It drives the
+  # real view and the real model against `App/UITestScenario.swift`'s synthetic
+  # seams, which are compiled only into DEBUG builds and reachable only when the
+  # app is launched with an explicit `-ui-test-scenario <name>` argument.
+  RommpleTVUITests:
+    type: bundle.ui-testing
+    platform: tvOS
+    sources: [AppUITests]
+    dependencies:
+      - target: RommpleTV
+    # Public.xcconfig carries the (optional, untracked) development team, so the
+    # bundle signs the same way the app does. The bundle identifier below
+    # overrides the one it sets — target settings win over an xcconfig — because
+    # two bundles may not share one.
+    configFiles:
+      Debug: Config/Public.xcconfig
+      Release: Config/Public.xcconfig
+    settings:
+      base:
+        SWIFT_VERSION: "5.0"
+        TVOS_DEPLOYMENT_TARGET: "17.0"
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.rommpletv.uitests
+        TEST_TARGET_NAME: RommpleTV
+schemes:
+  RommpleTVUITests:
+    build:
+      targets:
+        RommpleTVUITests: [test]
+    test:
+      config: Debug
+      targets:
+        - RommpleTVUITests
+    run:
+      config: Debug

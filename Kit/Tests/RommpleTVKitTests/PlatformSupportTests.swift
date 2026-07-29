@@ -21,12 +21,25 @@ final class PlatformSupportTests: XCTestCase {
         }
     }
     func testUnplayableSlugs() {
-        for slug in ["gamecube", "wii", "ps2", "switch", "n64", "psx"] {
+        for slug in ["gamecube", "wii", "ps2", "switch", "n64"] {
             XCTAssertNil(PlatformSupport.core(forSlug: slug), slug)
             XCTAssertFalse(PlatformSupport.isPlayable(slug: slug), slug)
         }
     }
     func testCaseInsensitive() {
         XCTAssertNotNil(PlatformSupport.core(forSlug: "SNES"))
+        XCTAssertTrue(PlatformSupport.isPlayable(slug: "SNES"))
+    }
+    /// The slug flip Task 10 owns. `psx` is the real PlayStation platform on the
+    /// live server; `ps1` is a stray empty platform kept as a harmless alias, and
+    /// both are launchable now that every launch goes through
+    /// `LaunchPreparationService` rather than the legacy single-file path.
+    func testPlayStationUsesSoftwareBeetlePSX() {
+        let core = PlatformSupport.core(forSlug: "psx")
+        XCTAssertEqual(core?.coreName, "mednafen_psx_libretro_tvos")
+        XCTAssertEqual(core?.displayName, "Beetle PSX")
+        XCTAssertTrue(PlatformSupport.isPlayable(slug: "PSX"))
+        XCTAssertEqual(PlatformSupport.core(forSlug: "ps1")?.coreName, "mednafen_psx_libretro_tvos")
+        XCTAssertTrue(PlatformSupport.isPlayable(slug: "ps1"))
     }
 }

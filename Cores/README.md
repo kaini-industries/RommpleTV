@@ -33,6 +33,7 @@ libretro documentation page for authorship and license terms.
 | `genesis_plus_gx` | Genesis Plus GX | Genesis/Mega Drive, Master System, Game Gear | [libretro/Genesis-Plus-GX](https://github.com/libretro/Genesis-Plus-GX) | [docs.libretro.com](https://docs.libretro.com/library/genesis_plus_gx/) |
 | `fceumm` | FCEUmm | NES | [libretro/libretro-fceumm](https://github.com/libretro/libretro-fceumm) | [docs.libretro.com](https://docs.libretro.com/library/fceumm/) |
 | `mednafen_vb` | Beetle VB (Mednafen VB) | Virtual Boy | [libretro/beetle-vb-libretro](https://github.com/libretro/beetle-vb-libretro) | [docs.libretro.com](https://docs.libretro.com/library/beetle_vb/) |
+| `mednafen_psx` | Beetle PSX (Mednafen PSX, software renderer) | PlayStation | [libretro/beetle-psx-libretro](https://github.com/libretro/beetle-psx-libretro) | [docs.libretro.com](https://docs.libretro.com/library/beetle_psx/) — [GPLv2](https://github.com/libretro/beetle-psx-libretro/blob/master/COPYING) |
 
 These cores are downloaded, not bundled here. RommpleTV ships no games, firmware,
 saves, artwork, or emulator binaries; supply only content you are legally
