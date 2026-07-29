@@ -4,7 +4,9 @@ RommpleTV is a native tvOS client for a self-hosted [RomM](https://romm.app) ser
 
 ## Status
 
-Early development. Supported systems currently include SNES, NES, Game Boy/Game Boy Color/Game Boy Advance, Genesis/Master System/Game Gear, and Virtual Boy.
+Early development. Supported systems currently include SNES, NES, Game Boy/Game Boy Color/Game Boy Advance, Genesis/Master System/Game Gear, Virtual Boy, and PlayStation.
+
+PlayStation support covers single- and multi-disc cue/bin games, automatic BIOS retrieval from RomM's firmware library, disc switching from the pause overlay, and memory-card synchronization back to RomM with conflict resolution. It needs the standard BIOS images (`scph5500.bin`, `scph5501.bin`, `scph5502.bin`) present and verified on your RomM server for the regions you play; RommpleTV will name the exact file it is missing. Discs are streamed and every file is checked against the size and every hash RomM publishes before a game will launch.
 
 ## Requirements
 
