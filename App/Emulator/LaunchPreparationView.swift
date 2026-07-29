@@ -82,7 +82,10 @@ struct LaunchPreparationView<Ready: View>: View {
             } else {
                 ProgressView().frame(maxWidth: 800)
             }
-            if !model.progress.detail.isEmpty {
+            // `headline` already falls back to `detail` during the disc phase,
+            // because "Discs" alone names nothing a player can act on. Printing
+            // it again below the bar just says "Disc 1" twice.
+            if !model.progress.detail.isEmpty, model.progress.detail != model.progress.headline {
                 Text(model.progress.detail)
                     .font(.caption).foregroundStyle(.secondary).lineLimit(1)
                     .accessibilityIdentifier("prep.detail")
